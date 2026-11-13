@@ -61,7 +61,6 @@ const (
 	AttributeNumMessages              = "num_messages"
 	AttributeOwnerExecMsgIndex        = "owner_exec_msg_index"
 	AttributeKeyAckSuccess            = "success"
-	AttributeKeyAckError              = "error"
 	AttributeWindowEndHeight          = "window_end_height"
 	AttributeProviderValidatorAddress = "provider_validator_address"
 	AttributeConsumerMisbehaviour     = "consumer_misbehaviour"

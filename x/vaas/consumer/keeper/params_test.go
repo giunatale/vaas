@@ -31,9 +31,9 @@ func TestParams(t *testing.T) {
 	params = consumerKeeper.GetConsumerParams(ctx)
 	require.Equal(t, newParams, params)
 
-	consumerKeeper.SetUnbondingPeriod(ctx, time.Hour*24*10)
-	storedUnbondingPeriod := consumerKeeper.GetUnbondingPeriod(ctx)
-	require.Equal(t, time.Hour*24*10, storedUnbondingPeriod)
+	newParams.UnbondingPeriod = time.Hour * 24 * 10
+	consumerKeeper.SetParams(ctx, newParams)
+	require.Equal(t, time.Hour*24*10, consumerKeeper.GetConsumerParams(ctx).UnbondingPeriod)
 }
 
 // TestPhotonFeesEnabledParam covers the accessor the photon fee ante decorator
