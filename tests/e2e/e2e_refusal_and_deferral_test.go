@@ -443,7 +443,7 @@ func (s *baseTestSuite) mustUnjail(key, valoper string) {
 }
 
 // removalProposalJSON builds a MsgRemoveConsumer gov proposal body.
-func (s *baseTestSuite) removalProposalJSON(consumerID, title string) string { //nolint:unparam // the suites drive one consumer; the helper stays generic
+func (s *baseTestSuite) removalProposalJSON(consumerID, title string) string {
 	govAddr := s.queryGovAuthority()
 	return fmt.Sprintf(`{
   "messages": [{
@@ -460,7 +460,7 @@ func (s *baseTestSuite) removalProposalJSON(consumerID, title string) string { /
 
 // setConsumerRefusal records or withdraws val's refusal of the consumer and
 // waits for the tx to commit.
-func (s *baseTestSuite) setConsumerRefusal(consumerID string, refused bool) {
+func (s *baseTestSuite) setConsumerRefusal(consumerID string, refused bool) { //nolint:unparam // the suites drive one consumer; the helper stays generic
 	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
 		providerBinary, "tx", "vaasprovider", "set-consumer-refusal", consumerID, strconv.FormatBool(refused),
 		"--from", "val",

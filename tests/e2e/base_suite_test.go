@@ -1011,7 +1011,7 @@ func (s *baseTestSuite) tendermintClientTracking(containerID, binary, homePath, 
 // update-consumer, and the consumer learns its provider client from the
 // owner's set-provider-client. Until both land, VSC packets stay queued on the
 // provider and rejected by the consumer.
-func (s *baseTestSuite) declareConsumerClients(consumerID string) {
+func (s *baseTestSuite) declareConsumerClients(consumerID string) { //nolint:unparam // the suites drive one consumer; the helper stays generic
 	providerClientID := s.tendermintClientTracking(
 		s.providerValRes[0].Container.ID, providerBinary, providerHomePath, s.cfg.consumerChainID)
 	s.T().Logf("declaring consumer client on the provider: %s", providerClientID)
