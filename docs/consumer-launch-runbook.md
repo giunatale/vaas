@@ -122,6 +122,22 @@ consumer's `InitGenesis` installs the initial validator set from the genesis.
 It creates no IBC client: the clients come from the relayer and are declared by
 the owner in the next step.
 
+Run `consumerd genesis validate` after the injection, not before: without the
+provider's payload it fails with `initial validator set is empty`.
+
+The consumer genesis's CometBFT consensus parameters
+(`consensus.params.validator.pub_key_types`) must admit every key type the
+provider's own `pub_key_types` does. The provider restricts assigned consumer
+keys to ed25519, but a validator without an assignment is sent under its
+provider consensus key, whatever type the provider admits, and CometBFT fails
+the block that carries a validator update of a type the consumer excludes.
+Both chains at CometBFT's default (ed25519 only) agree.
+
+`init` writes `minimum-gas-prices = "0uatone"` into `app.toml` on both the
+provider and the consumer binary so a fresh node starts; set a real floor on
+every node you run (the e2e sets `0.01uatone`), or the node admits
+transactions that pay nothing.
+
 ## 4. Create the IBC v2 path and declare the clients
 
 A relayer creates an IBC v2 client on each chain pointing at the other and

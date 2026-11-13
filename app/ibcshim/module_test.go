@@ -32,7 +32,7 @@ func entry(clientID, counterpartyID string) clientv2types.GenesisCounterpartyInf
 // The reason this package exists: two fresh chains both name their first
 // client 07-tendermint-0, ibc-go's own RegisterCounterparty accepts the
 // pairing, and only its genesis Validate rejects it, so an exported state
-// cannot be re-imported. Upstream's clientv2.InitGenesis panics on this input.
+// cannot be re-imported. ibc-go's clientv2.InitGenesis panics on this input.
 func TestInitClientV2GenesisAcceptsCollidingCrossChainIds(t *testing.T) {
 	r := &recordingSetter{set: map[string]clientv2types.CounterpartyInfo{}}
 	gs := clientv2types.GenesisState{

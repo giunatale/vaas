@@ -69,7 +69,7 @@ func TestFeePoolSendRestriction_BlocksUnsanctionedSenders(t *testing.T) {
 }
 
 // TestFeePoolSendRestriction_CrossConsumerIsolation: a send to one consumer's
-// fee pool from another consumer's fee pool is blocked — fee pool addresses
+// fee pool from another consumer's fee pool is blocked: fee pool addresses
 // are not on the sanctioned-sender list.
 func TestFeePoolSendRestriction_CrossConsumerIsolation(t *testing.T) {
 	k, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))

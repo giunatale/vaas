@@ -14,8 +14,9 @@ import (
 	ibcconsumerkeeper "github.com/allinbits/vaas/x/vaas/consumer/keeper"
 )
 
-// HandlerOptions extend the SDK's AnteHandler options by requiring the IBC
-// channel keeper.
+// HandlerOptions extend cosmos-sdk's ante.HandlerOptions with the ibc-go
+// keeper the redundant-relay decorator needs and the consumer keeper the
+// message filter and photon fee decorators read.
 type HandlerOptions struct {
 	ante.HandlerOptions
 

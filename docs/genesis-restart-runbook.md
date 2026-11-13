@@ -146,10 +146,13 @@ unpacks the stored key exactly as `x/staking` does.
 
 For a coordinated stop-and-restart (state-export upgrade):
 
-1. Stop the provider and every consumer at the same agreed height (a governance
-   software-upgrade halt, or a coordinated `halt-height`). A clean halt at a
-   shared height keeps the IBC clients and any in-flight packets mutually
-   consistent.
+1. Stop the provider and every consumer at the same agreed height with
+   `halt-height` in each node's `app.toml`. A passed `MsgSoftwareUpgrade` also
+   halts every node at its height, but neither app registers an upgrade
+   handler, so after that halt the binary starts only with
+   `--unsafe-skip-upgrades <height>` on every node; `halt-height` is the
+   mechanism to use. A clean halt at a shared height keeps the IBC clients and
+   any in-flight packets mutually consistent.
 2. On each chain run `export` at that height and `genesis validate` the result.
 3. Assemble the new `genesis.json` for each chain from its exported app state,
    carrying over `chain_id` (or bumping it per your upgrade policy) and the
