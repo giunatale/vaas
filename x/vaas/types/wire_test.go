@@ -63,7 +63,7 @@ func TestValidatorSetChangePacketDataValidateValidatorUpdates(t *testing.T) {
 	})
 
 	t.Run("wrong-length pubkey is rejected", func(t *testing.T) {
-		// A 31-byte ed25519 key decodes under the SDK's permissive
+		// A 31-byte ed25519 key decodes under cosmos-sdk's permissive
 		// conversion but panics later at PubKey.Address(); the validation
 		// must reject it at receipt.
 		short := cmtprotocrypto.PublicKey{Sum: &cmtprotocrypto.PublicKey_Ed25519{Ed25519: make([]byte, 31)}}
@@ -129,7 +129,7 @@ func TestEvidencePacketDataMaxMissed(t *testing.T) {
 // than nil-panicking on the nil-backed dec.
 func TestEvidencePacketDataValidateNilMinSignedPerWindow(t *testing.T) {
 	packet := types.NewEvidencePacketData(
-		sdk.ConsAddress([]byte{0x01, 0x02, 0x03, 0x04, 0x05}), 93, []byte{0x3F}, 8, 8, math.LegacyMustNewDecFromStr("0.5"),
+		sdk.ConsAddress([]byte("20-byte-cons-address")), 93, []byte{0x3F}, 8, 8, math.LegacyMustNewDecFromStr("0.5"),
 	)
 
 	var fields map[string]json.RawMessage

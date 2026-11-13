@@ -174,9 +174,9 @@ func NewSubmitConsumerDoubleVotingCmd() *cobra.Command {
 		Use:   "submit-consumer-double-voting [consumer-id] [evidence] [infraction_header]",
 		Short: "submit a double voting evidence for a consumer chain",
 		Long: strings.TrimSpace(
-			fmt.Sprintf(`Submit a Tendermint duplicate vote evidence detected on a consumer chain with
+			fmt.Sprintf(`Submit CometBFT duplicate vote evidence detected on a consumer chain with
  the IBC light client header for the infraction height.
- The DuplicateVoteEvidence type definition can be found in the Tendermint messages,
+ The DuplicateVoteEvidence type definition can be found in the CometBFT protobuf messages,
  see cometbft/proto/tendermint/types/evidence.proto and the IBC header
  definition can be found in the IBC messages, see ibc-go/proto/ibc/lightclients/tendermint/v1/tendermint.proto.
 
@@ -278,8 +278,8 @@ where create_consumer.json has the following structure:
 }
 
 Note that both 'chain_id' and 'metadata' are mandatory;
-and 'initialization_parameters' is optional.
-The parameters not provided are set to their zero value.
+'initialization_parameters' is optional: omit the whole block and it is
+defaulted, supply it and every field in it is validated.
 `, version.AppName)),
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -329,15 +329,15 @@ func NewUpdateConsumerCmd() *cobra.Command {
 		Use:   "update-consumer [consumer-parameters]",
 		Short: "update a consumer chain",
 		Long: strings.TrimSpace(
-			fmt.Sprintf(`Update a consumer chain to change its parameters (e.g., spawn time, infraction parameters, etc.).
-Note that only the owner of the chain can initialize it.
+			fmt.Sprintf(`Update a consumer chain to change its parameters (e.g., spawn time, metadata, owner), or to declare its IBC client once a relayer has created it.
+Note that only the owner of the chain can update it.
 
 Example:
 %s tx vaasprovider update-consumer [path/to/update_consumer.json]
 
 where update_consumer.json has the following structure:
 {
-   "consumer_id": "0",
+   "consumer_id": 0, // a JSON number, not a string
    "new_owner_address": "cosmos10d07y265gmmuvt4z0w9aw880jnsr700j6zn9kn",
    "metadata": {
     "name": "chain consumer",
@@ -424,7 +424,10 @@ away, its fee-pool balance returns to its depositors, and its chain id frees
 for reuse; the consumer owner may sign, or the governance authority when the
 owner key is lost. A launched or paused consumer is stopped and erased after
 the unbonding period, and only the governance authority may sign, so from the
-CLI that path is a governance proposal rather than a direct transaction.
+CLI that path is a governance proposal rather than a direct transaction. The
+governance authority may also remove a consumer that already stopped for
+another reason: its deletion stays scheduled as it was, and the removal
+cancels its pending equivocation punishments and refuses later evidence.
 
 Example:
 %s tx vaasprovider remove-consumer 0 --from mykey

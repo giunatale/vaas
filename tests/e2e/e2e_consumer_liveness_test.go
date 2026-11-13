@@ -1,7 +1,7 @@
 package e2e
 
-// e2e_consumer_liveness_test.go exercises the liveness scenarios introduced by
-// issue #36 that require a full provider+consumer network:
+// e2e_consumer_liveness_test.go exercises the consumer liveness scenarios that
+// need a full provider+consumer network:
 //
 //   1. testLivenessTransientOutage - brief outage + valset change; the consumer
 //                                    stays LAUNCHED and re-converges after recovery.
@@ -18,15 +18,16 @@ package e2e
 // HARNESS CONSTRAINTS
 //
 // These tests share the single IntegrationTestSuite spun up by TestVAAS in
-// e2e_test.go.  That consumer's unbonding_period is ~20 days (from
-// testdata/create_consumer.json), so the derived liveness grace period
-// (unbonding * 0.66) is ~13 days.  Waiting for an automatic STOPPED transition
-// in real-time is therefore impractical in CI.
+// e2e_test.go.  The liveness grace period derives from the provider's
+// unbonding period (atomone-sdk's 21-day default in this suite) times
+// liveness_grace_fraction (0.66 by default), ~13.9 days.  Waiting for an
+// automatic STOPPED transition in real time is therefore impractical in CI.
 //
 // For testLivenessRemoval we issue an explicit remove-consumer via governance
-// (gov authority is required since PR #53), then assert the provider transitions
-// to STOPPED.  The STOPPED -> DELETED leg relies on removal_time elapsing, which
-// needs a short-unbonding consumer -- exercised by LivenessIntegrationTestSuite.
+// (only the gov authority may remove a launched consumer), then assert the
+// provider transitions to STOPPED.  The STOPPED -> DELETED leg relies on
+// removal_time elapsing, which needs a short-unbonding consumer -- exercised by
+// LivenessIntegrationTestSuite.
 //
 // For testLivenessTransientOutage we pause the consumer container (same
 // mechanism as testDowntimeSlash) for a brief window while the provider's valset
@@ -158,11 +159,10 @@ func (s *IntegrationTestSuite) testLivenessTransientOutage() {
 // consumer "0" being LAUNCHED. It needs nothing from the consumer itself, so
 // it also runs after the provider restart of testGenesisRoundTrip.
 //
-// Approximation note: the STOPPED -> DELETED transition requires
-// removal_time to elapse (unbonding * 0.66).  With the 20-day unbonding period
-// used by the shared suite this takes ~13 days, so within the test window the
-// consumer will remain STOPPED.  A timing-faithful CI test would use a
-// short-unbonding consumer (60s -> grace ~40s) launched in a dedicated suite.
+// Approximation note: the STOPPED -> DELETED transition happens at
+// removal_time, the stop plus the provider's unbonding period (21 days in this
+// suite), so within the test window the consumer remains STOPPED.  The
+// short-unbonding liveness suite is where the sweep runs on a CI-sized clock.
 func (s *IntegrationTestSuite) testLivenessRemoval() {
 	s.Run("liveness removal: explicit remove-consumer transitions to STOPPED", func() {
 		const consumerID = "0"
@@ -172,8 +172,8 @@ func (s *IntegrationTestSuite) testLivenessRemoval() {
 		s.Require().Equalf(phaseLaunched, phase,
 			"consumer %s must be LAUNCHED before the liveness removal test", consumerID)
 
-		// Issue an explicit remove-consumer via governance (gov authority is required
-		// since PR #53; a direct --from val tx would fail DeliverTx).
+		// Issue an explicit remove-consumer via governance (only the gov authority
+		// may remove a launched consumer; a direct --from val tx would fail DeliverTx).
 		s.T().Log("submitting remove-consumer governance proposal...")
 		govAddr := s.queryGovAuthority()
 		removeJSON := fmt.Sprintf(`{

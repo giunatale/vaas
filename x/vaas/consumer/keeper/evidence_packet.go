@@ -22,7 +22,7 @@ import (
 // packet per downtime window, so evidence for a later window is not lost while
 // an earlier window's packet is still waiting to be relayed.
 func pendingEvidenceKey(packet vaastypes.EvidencePacketData) collections.Pair[[]byte, int64] {
-	return collections.Join([]byte(packet.ValidatorAddr), packet.WindowEndHeight)
+	return collections.Join(packet.ValidatorAddr, packet.WindowEndHeight)
 }
 
 // The queue is bounded on two axes. maxPendingEvidencePerValidator caps how
@@ -54,7 +54,7 @@ func (k Keeper) QueueEvidencePacket(ctx sdk.Context, packet vaastypes.EvidencePa
 		return fmt.Errorf("failed to store evidence packet: %w", err)
 	}
 
-	return k.evictOldestPendingEvidence(ctx, []byte(packet.ValidatorAddr))
+	return k.evictOldestPendingEvidence(ctx, packet.ValidatorAddr)
 }
 
 // evictOldestPendingEvidence trims a validator's pending evidence down to
@@ -104,15 +104,18 @@ func (k Keeper) RequeueEvidencePacket(ctx sdk.Context, payload []byte) error {
 
 // ReportRejectedEvidencePacket surfaces a provider rejection of a
 // previously-sent evidence packet, used when the packet came back with an
-// error acknowledgement. The provider error-acks only after evaluating and
-// rejecting that exact packet (unacceptable echoed params, missed count below
-// threshold, unknown or renamed validator, window too old, window already
-// accepted, or below the pruned acceptance floor); every one of those is
-// permanent for a given packet, so re-sending the identical evidence could
-// never be accepted and would loop forever. The packet left the queue when it
-// was sent, so there is nothing to remove: this emits the event surfacing the
-// rejection (validator, window-end height) and deliberately does not
-// re-queue. The ack bytes themselves are not reported: an IBC v2 error
+// error acknowledgement. The provider error-acks a packet it evaluated and
+// rejected (unacceptable echoed params, missed count below threshold, unknown
+// or renamed validator, window too old, window already accepted, or below the
+// pruned acceptance floor), every one of which is permanent for that packet,
+// or any packet of a consumer it is not serving (paused, or stopped). Neither
+// is retried: re-sending evaluated evidence could never be accepted and would
+// loop forever, and downtime that falls inside a pause is deliberately not
+// punished (the provider is not serving the consumer, and the validators a
+// refusal pause protects are not to be accused for it). The packet left the
+// queue when it was sent, so there is nothing to remove: this emits the event
+// surfacing the rejection (validator, window-end height) and deliberately does
+// not re-queue. The ack bytes themselves are not reported: an IBC v2 error
 // acknowledgement is a sentinel constant carrying no application error.
 func (k Keeper) ReportRejectedEvidencePacket(ctx sdk.Context, payload []byte) {
 	validatorAddr := ""
@@ -123,7 +126,7 @@ func (k Keeper) ReportRejectedEvidencePacket(ctx sdk.Context, payload []byte) {
 			"error", err,
 		)
 	} else {
-		validatorAddr = packet.ValidatorAddr.String()
+		validatorAddr = packet.ConsAddress().String()
 		windowEndHeight = packet.WindowEndHeight
 		k.Logger(ctx).Error("evidence packet rejected by provider; not retried",
 			"validator", validatorAddr,
@@ -224,14 +227,14 @@ func (k Keeper) SendEvidencePackets(ctx sdk.Context) error {
 		if err != nil {
 			k.Logger(ctx).Error("failed to send evidence packet",
 				"error", err,
-				"validator", evidencePacket.ValidatorAddr.String(),
+				"validator", evidencePacket.ConsAddress().String(),
 			)
 			continue
 		}
 
 		k.Logger(ctx).Info("evidence packet sent",
 			"sequence", resp.Sequence,
-			"validator", evidencePacket.ValidatorAddr.String(),
+			"validator", evidencePacket.ConsAddress().String(),
 			"infraction", evidencePacket.Infraction.String(),
 			"window_end_height", evidencePacket.WindowEndHeight,
 		)
@@ -243,7 +246,7 @@ func (k Keeper) SendEvidencePackets(ctx sdk.Context) error {
 			sdk.NewEvent(
 				vaastypes.EventTypeConsumerEvidenceRequest,
 				sdk.NewAttribute(sdk.AttributeKeyModule, types.ModuleName),
-				sdk.NewAttribute(vaastypes.AttributeValidatorAddress, evidencePacket.ValidatorAddr.String()),
+				sdk.NewAttribute(vaastypes.AttributeValidatorAddress, evidencePacket.ConsAddress().String()),
 				sdk.NewAttribute(vaastypes.AttributeWindowEndHeight, fmt.Sprintf("%d", evidencePacket.WindowEndHeight)),
 				sdk.NewAttribute(vaastypes.AttributeInfractionType, evidencePacket.Infraction.String()),
 			),

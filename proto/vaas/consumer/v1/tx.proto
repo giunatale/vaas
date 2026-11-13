@@ -2,46 +2,58 @@ syntax = "proto3";
 package vaas.consumer.v1;
 option go_package = "github.com/allinbits/vaas/x/vaas/consumer/types";
 
-import "amino/amino.proto";
-import "google/api/annotations.proto";
 import "gogoproto/gogo.proto";
 import "cosmos_proto/cosmos.proto";
 import "cosmos/msg/v1/msg.proto";
+import "google/protobuf/any.proto";
 import "vaas/v1/shared_consumer.proto";
 
 // Msg defines the Msg service.
 service Msg {
   option (cosmos.msg.v1.service) = true;
+
+  // UpdateParams updates the params.
   rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
-  rpc SetProviderClient(MsgSetProviderClient) returns (MsgSetProviderClientResponse);
+
+  // SetProviderClient pins the IBC client the consumer treats as the provider,
+  // exactly once, at bootstrap.
+  rpc SetProviderClient(MsgSetProviderClient)
+      returns (MsgSetProviderClientResponse);
+  // OwnerExec executes authority-signed messages on the owner's behalf, as the
+  // consumer module account.
+  rpc OwnerExec(MsgOwnerExec) returns (MsgOwnerExecResponse);
 }
 
 // MsgUpdateParams is the Msg/UpdateParams request type
 message MsgUpdateParams {
   option (cosmos.msg.v1.signer) = "authority";
 
-  // signer is the address of the governance account.
-  string authority = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  // authority is the address of the chain's authority: the consumer module
+  // account on the reference consumer, the x/gov module account where it is
+  // wired.
+  string authority = 1 [ (cosmos_proto.scalar) = "cosmos.AddressString" ];
 
   // params defines the x/provider parameters to update.
-  vaas.v1.ConsumerParams params = 2 [(gogoproto.nullable) = false];
+  vaas.v1.ConsumerParams params = 2 [ (gogoproto.nullable) = false ];
 }
 
+// MsgUpdateParamsResponse defines the response type for MsgUpdateParams
+// messages.
 message MsgUpdateParamsResponse {}
 
 // MsgSetProviderClient pins the IBC client the consumer treats as the
 // provider, exactly once, at bootstrap. Only the owner seeded into the
-// consumer params by the provider (or the governance authority) may submit
-// it, and it is accepted only while no provider client is pinned: after the
-// pin is set it never moves, and recovering an expired or frozen pinned
-// client is governance's MsgRecoverClient, which substitutes fresh client
-// state under the same client id.
+// consumer params by the provider (or the chain's authority) may submit it,
+// and it is accepted only while no provider client is pinned: after the pin
+// is set it never moves, and recovering an expired or frozen pinned client
+// is MsgRecoverClient by the chain's authority, which substitutes fresh
+// client state under the same client id.
 message MsgSetProviderClient {
   option (cosmos.msg.v1.signer) = "signer";
 
   // the consumer-chain account submitting the pin: the owner seeded in the
-  // consumer params, or the governance authority.
-  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  // consumer params, or the chain's authority.
+  string signer = 1 [ (cosmos_proto.scalar) = "cosmos.AddressString" ];
 
   // the IBC client id to pin as the provider client. It must exist, be an
   // Active tendermint client tracking the provider chain id pinned at
@@ -49,4 +61,30 @@ message MsgSetProviderClient {
   string client_id = 2;
 }
 
+// MsgSetProviderClientResponse defines the response type for
+// MsgSetProviderClient messages.
 message MsgSetProviderClientResponse {}
+
+// MsgOwnerExec lets the consumer's owner exercise the authority the
+// embedding app grants the VAAS consumer module account. Every message it
+// carries must be signed by that account and is executed, in order, as if
+// the account had signed it: this is how a consumer with no governance of
+// its own recovers its provider client (MsgRecoverClient), schedules an
+// upgrade or updates its parameters, when the app names the consumer module
+// as those keepers' authority. Only the owner the provider seeded into the
+// consumer params may submit it, and the message cannot nest.
+message MsgOwnerExec {
+  option (cosmos.msg.v1.signer) = "signer";
+
+  // the consumer-chain account submitting the messages: the owner seeded
+  // in the consumer params.
+  string signer = 1 [ (cosmos_proto.scalar) = "cosmos.AddressString" ];
+
+  // the messages to execute, each signed by the consumer module account
+  // (OwnerExecAuthority).
+  repeated google.protobuf.Any messages = 2
+      [ (cosmos_proto.accepts_interface) = "cosmos.base.v1beta1.Msg" ];
+}
+
+// MsgOwnerExecResponse is the response of MsgOwnerExec.
+message MsgOwnerExecResponse {}

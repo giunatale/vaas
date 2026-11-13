@@ -51,7 +51,23 @@ Both files are decoded with the proto-JSON codec. CLI source:
 `HandleConsumerDoubleVoting` in
 [x/vaas/provider/keeper/consumer_equivocation.go](../x/vaas/provider/keeper/consumer_equivocation.go):
 
-1. Requires the consumer to be `LAUNCHED`.
+1. Requires a consumer that has launched and is not yet deleted: `LAUNCHED`,
+   `PAUSED` or `STOPPED`. A pause or a stop does not void a double-sign: the
+   punishment it queues is frozen with a pause and runs on its own clock
+   through a stop, and the evidence is self-contained, so refusing it off
+   `LAUNCHED` would let a validator whose consumer is paused or stopped
+   before its evidence lands escape. The one exception is a consumer
+   governance removed: that verdict cancels its pending punishments and voids
+   any evidence submitted afterwards, so a consumer that carries it cannot be
+   removed a second time. A stop by the liveness sweep or by a lapsed pause is
+   not a verdict, and a consumer stopped that way can still be put to a
+   removal vote: its `MsgRemoveConsumer` records the verdict and cancels the
+   pending punishments, while the consumer stays `STOPPED` and its deletion
+   keeps the time the stop scheduled.
+   The votes are verified over the consumer's chain id, or over a chain id the
+   consumer carried before a governance rename when the infraction block is at
+   or below the declared client's height at that rename (`EvidenceChainIdFor`;
+   see [consumer-lifecycle.md](consumer-lifecycle.md) on renames).
 2. Rejects evidence older than the consumer's equivocation-evidence minimum
    height. Note the *age* of the vote is not otherwise bounded -- there is no
    max-age on double-vote evidence.
@@ -71,14 +87,17 @@ Both files are decoded with the proto-JSON codec. CLI source:
    [consumer-refusal.md](consumer-refusal.md) section 3. Repeated submissions
    of already-processed evidence are idempotent: already queued is a no-op,
    already-tombstoned is not an error, and a double-sign whose punishment
-   executed without tombstoning (`double_sign.tombstone = false`) is
-   remembered by chain id, live provider consensus address and infraction
-   height (`PunishedEquivocations`, which follows consumer key rotation and
-   is cleared once the validator is tombstoned), so the same infraction is
-   never punished twice. The record is keyed by the chain id the votes were
-   signed over and outlives the consumer: a consumer that re-registers a
-   deleted consumer's chain id cannot be handed the dead chain's double-signs
-   and punish them again.
+   was queued is remembered by chain id, live provider consensus address and
+   infraction height (`PunishedEquivocations`), so the same infraction is
+   never punished twice. The record is written whatever
+   `double_sign.tombstone` says at the time: the policy is read again when
+   the punishment executes, and a governance change in between must not
+   make the same two votes punishable again. It follows consumer key
+   rotation and is dropped once the validator is tombstoned, the tombstone
+   stopping every later submission by itself. It is keyed by the chain id
+   the votes were signed over and outlives the consumer: a consumer that
+   re-registers a deleted consumer's chain id cannot be handed the dead
+   chain's double-signs and punish them again.
 
 On success the provider emits `vaas_submit_consumer_double_voting` and
 `vaas_equivocation_punishment_queued`; the resolution later emits
@@ -89,6 +108,12 @@ The slash fraction, jail duration, and tombstone flag are the global infraction
 parameters (see [params-reference.md](params-reference.md) section 2); with the
 defaults, a double-signer whose consumer governance does not remove is slashed
 5% and permanently removed seven days after the evidence is accepted.
+
+The slash is applied with infraction height 0: a consumer height cannot be
+mapped to a provider height, so `x/staking` slashes every unmatured
+undelegation and redelegation from the validator, whenever it began, as well
+as its bonded stake, and the slashable power the fraction applies to counts
+that in-flight stake in (`ComputePowerToSlash`).
 
 ---
 
@@ -135,7 +160,8 @@ this path:
    already frozen or expired is left alone), so no packet proven against the
    fork lands on the provider, and the consumer is **paused**
    (`PauseConsumerChain` under `PAUSE_REASON_LIGHT_CLIENT_ATTACK`): VSC service
-   stops, both evidence paths reject the consumer (they gate on `LAUNCHED`), its
+   stops, the downtime path rejects the consumer (double-voting evidence is
+   still accepted and queues a punishment frozen with the pause), its
    pending downtime accusations are cancelled and the fees withheld on their
    account repaid, and an auto-stop is scheduled at `MaxPauseDuration` so
    governance silence converges to `STOPPED`.
@@ -144,7 +170,16 @@ A fork reported through ibc-go's `MsgUpdateClient` instead, the path a generic
 relayer or watcher takes, freezes the client without the provider hearing of
 it. The provider's BeginBlock pauses a launched consumer whose client is
 frozen, so the containment is the same, one block later and without the
-attribution.
+attribution. A consumer already paused for a downtime challenge or a refusal
+when its client freezes is moved under the light-client reason the same way:
+its accusations are discarded as a fresh light-client pause discards them, and
+the fork is recorded as known from that block, which the resume's wait below
+counts from; the pause keeps the time it began. A consumer already paused for
+a light-client attack is followed through a recovery: its client recovered
+during the pause and frozen again by a later fork has the fork recorded as
+known from the block it is next seen frozen at. Left unseen, either fork would
+cost a governance round: a recover-and-resume proposal would land the consumer
+back in `LAUNCHED` only for the same headers to pause it again.
 
 Nobody is slashed, jailed, or tombstoned, deliberately. A malicious consumer
 binary can orchestrate a fork in which every honest validator signs each
@@ -155,13 +190,15 @@ attacker a targeting tool. The full rationale, including why this must not be
 
 What happens after containment is a governance decision: `MsgResumeConsumer`
 resumes the chain (with a forced snapshot) once the fork is understood and
-fixed, bundling ibc-go's `MsgRecoverClient` for the frozen client, or the pause
-expires into `STOPPED`. The resume waits out the fork's evidence: a recovery
-keeps the client's pre-fork consensus states, against which the conflicting
-headers verify on either submission path until those states age out of the
-trusting period, so the resume is refused until one trusting period (plus the
-client's clock-drift allowance) has passed since the pause. A fork at a later
-height is new evidence and pauses it again.
+fixed, bundling ibc-go's `MsgRecoverClient` for the frozen client, or the
+pause expires into `STOPPED`. The resume waits out the fork's evidence: a
+recovery keeps the client's pre-fork consensus states, against which the
+conflicting headers verify on either submission path until those states age
+out of the trusting period, so the resume is refused until one trusting period
+(plus the client's clock-drift allowance) has passed since the fork became
+known: the pause, or the block a challenge or refusal pause was moved under
+the light-client reason at. A fork at a later height is new evidence and
+pauses it again.
 
 ---
 

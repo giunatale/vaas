@@ -74,7 +74,7 @@ func (k Keeper) EndBlockVSU(ctx sdk.Context) ([]abci.ValidatorUpdate, error) {
 		}
 
 		// try sending VSC packets to all launched consumer chains;
-		// if a consumer's IBC client has not been discovered yet,
+		// if a consumer's IBC client has not been declared yet,
 		// the updates remain queued until it is
 		if err := k.SendVSCPackets(ctx); err != nil {
 			return []abci.ValidatorUpdate{}, fmt.Errorf("sending consumer validator updates: %w", err)
@@ -155,6 +155,19 @@ func (k Keeper) SendVSCPackets(ctx sdk.Context) error {
 }
 
 func (k Keeper) SendVSCPacketsToChain(ctx sdk.Context, consumerId uint64, clientId string) error {
+	// A client whose chain id is not the consumer's is not served, on any
+	// path that sends from a block (the epoch send and the rotation
+	// snapshots): serving it would run a consumer the provider cannot
+	// judge, as its double-voting evidence is verified over the consumer's
+	// chain id. The next BeginBlock pauses such a consumer
+	// (PauseConsumersWithMismatchedClients); this covers the rest of the
+	// block in which a client upgrade or recovery lands. The packets stay
+	// queued. The resume path refuses the mismatch before its own send.
+	if clientChainId, mismatch := k.consumerClientChainIdMismatch(ctx, consumerId, clientId); mismatch {
+		k.Logger(ctx).Info("consumer client tracks another chain id; packets stay queued",
+			"consumerId", consumerId, "clientId", clientId, "clientChainId", clientChainId)
+		return nil
+	}
 	// EndBlock cannot fail the block over a relayer or client hiccup: any
 	// send error is logged (inside sendVSCPacketsToChainStrict) and
 	// swallowed here, leaving the packets queued for a retry next epoch.
@@ -167,9 +180,11 @@ func (k Keeper) SendVSCPacketsToChain(ctx sdk.Context, consumerId uint64, client
 // sendVSCPacketsToChainStrict sends every pending VSC packet for a consumer
 // over the given IBC v2 client, in order, stopping at and returning the
 // first send error instead of swallowing it. On success all pending packets
-// have been sent and are cleared; on failure the packets from the failing
-// one onward remain queued untouched, so a retry (next epoch, or a repeated
-// call) resends exactly what did not go through.
+// have been sent and are cleared; on failure the queue is left as it was,
+// the packets sent before the failure included, so a retry (next epoch, or a
+// repeated call) resends those too. That is harmless: the consumer drops a
+// packet whose ValsetUpdateId it has already applied, and a non-empty queue
+// makes the next epoch's packet a snapshot anyway (see QueueVSCPackets).
 //
 // This is the shared implementation behind two callers with different error
 // contracts: SendVSCPacketsToChain (the EndBlock wrapper above) swallows the
@@ -267,18 +282,17 @@ func (k Keeper) QueueVSCPackets(ctx sdk.Context) error {
 
 		// Send a full snapshot when the consumer is behind (i.e. it has
 		// unacknowledged packets) or still has a packet stuck in the local
-		// send queue (e.g. a client that hasn't been discovered yet, or a
+		// send queue (e.g. a client that hasn't been declared yet, or a
 		// prior send that failed and left highestSent unadvanced). Invariant:
 		// never stack a diff behind an undelivered packet -- a diff assumes
 		// the consumer already applied everything before it, which may never
 		// hold once packets can be dropped or reordered; a snapshot converges
 		// regardless of arrival order.
 		//
-		// Also force a snapshot when the stored ConsumerValSet is empty: the
-		// provider does not export the per-consumer valset, so the first epoch
-		// after a state-export restart would otherwise diff the live bonded
-		// set against an empty stored set and emit only additions, never the
-		// power-0 removal for a validator that unbonded during the outage --
+		// Also force a snapshot when the stored ConsumerValSet is empty, as on
+		// a consumer's first epoch or after a hand-built genesis that omits
+		// the set: a diff against an empty set would emit only additions,
+		// never the power-0 removal for a validator that left the bonded set,
 		// leaving it with consensus power on the consumer indefinitely. A
 		// snapshot reconciles the consumer's set regardless.
 		isSnapshot := len(currentValSet) == 0 ||
@@ -373,10 +387,9 @@ func (k Keeper) QueueImmediateSnapshotVSCPacket(ctx sdk.Context, consumerId uint
 // out too: they have no client to send over, and resuming a paused one forces
 // its own snapshot (see ResumeConsumerChain).
 //
-// The snapshot goes out over the client already discovered for the consumer,
-// without re-running client discovery: that scan belongs to the epoch path,
-// which runs it for every consumer anyway, and a rotation must not pay for it.
-// A consumer with no discovered client yet simply keeps the packet queued.
+// The snapshot goes out over the client the owner declared for the consumer
+// (see SetConsumerClient). A consumer with no declared client yet simply keeps
+// the packet queued.
 //
 // Called from Hooks.AfterConsensusPubKeyUpdate in EndBlock, so nothing here may
 // fail the block: a snapshot that cannot be computed is logged and skipped, and
@@ -399,7 +412,7 @@ func (k Keeper) QueueConsPubKeyRotationSnapshots(ctx sdk.Context, newProviderAdd
 
 		clientId, found := k.GetConsumerClientId(ctx, consumerId)
 		if !found {
-			k.Logger(ctx).Error("no client discovered for consumer; consensus-key rotation snapshot stays queued for the next epoch",
+			k.Logger(ctx).Error("no client declared for consumer; consensus-key rotation snapshot stays queued for the next epoch",
 				"consumerId", consumerId,
 				"providerConsAddr", newProviderAddr.String(),
 			)

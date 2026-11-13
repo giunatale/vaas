@@ -2,6 +2,7 @@ package types_test
 
 import (
 	"encoding/json"
+	stdmath "math"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/cosmos/cosmos-sdk/codec"
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
 
 	"github.com/allinbits/vaas/x/vaas/provider/types"
 )
@@ -27,40 +29,54 @@ func TestValidateParams(t *testing.T) {
 		// 0.6 of the default consumer unbonding period covers the default
 		// challengeable interval; a smaller fraction would not (see below).
 		{"custom valid params", types.NewParams("0.6", "0.5", time.Hour, 1000, math.NewInt(42), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
-			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters()), true},
+			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(), types.DefaultConsumerRegistrationFee()), true},
 		{"zero fees per block", types.NewParams("0.33", "0.5", time.Hour, 1000, math.NewInt(0), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
-			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters()), false},
+			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(), types.DefaultConsumerRegistrationFee()), false},
+		{"epoch fee at the int64 bound", types.NewParams("0.6", "0.5", time.Hour, 1000, math.NewInt(stdmath.MaxInt64/1000), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
+			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(), types.DefaultConsumerRegistrationFee()), true},
+		{"epoch fee past the int64 bound", types.NewParams("0.6", "0.5", time.Hour, 1000, math.NewInt(stdmath.MaxInt64/1000+1), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
+			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(), types.DefaultConsumerRegistrationFee()), false},
+		{"fees per block past int64", types.NewParams("0.6", "0.5", time.Hour, 1, math.NewIntFromUint64(stdmath.MaxUint64), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
+			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(), types.DefaultConsumerRegistrationFee()), false},
 		{"0 trusting period fraction", types.NewParams(
 			"0.00", "0.5", time.Hour, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
 			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
 		{"0 liveness grace fraction", types.NewParams(
 			"0.33", "0.00", time.Hour, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
 			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
 		{"0 VAAS timeout period", types.NewParams(
 			"0.33", "0.5", 0, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
 			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
 		{"0 max pause duration", types.NewParams(
 			"0.33", "0.5", time.Hour, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, 0,
 			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
 		{"0 refusal pause threshold", types.NewParams(
 			"0.6", "0.5", time.Hour, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
 			"0.00", types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
 		{"refusal pause threshold of one", types.NewParams(
 			"0.6", "0.5", time.Hour, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
 			"1.00", types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
 		{"zero equivocation execution delay", types.NewParams(
 			"0.6", "0.5", time.Hour, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
 			types.DefaultRefusalPauseThreshold, 0, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
 		{"negative removal vote deferral margin", types.NewParams(
 			"0.6", "0.5", time.Hour, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration,
 			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, -time.Minute, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
 		{"invalid infraction parameters", withInfraction(func(ip *types.InfractionParameters) { ip.DoubleSign = nil }), false},
 		{"infraction horizon at the trusting period", withInfraction(func(ip *types.InfractionParameters) {
@@ -71,7 +87,15 @@ func TestValidateParams(t *testing.T) {
 		{"negative max pause duration", types.NewParams(
 			"0.33", "0.5", time.Hour, 1000, math.NewInt(1), types.DefaultMinDepositBlocks, -time.Hour,
 			types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin, types.DefaultInfractionParameters(),
+			types.DefaultConsumerRegistrationFee(),
 		), false},
+		{"positive registration fee", withRegistrationFee(sdk.NewInt64Coin(types.DefaultFeesPerBlockDenom, 1_000_000)), true},
+		// Params.Validate only knows the coin is well formed; that a positive
+		// fee is in the fee denom is the keeper's check.
+		{"registration fee in another denom", withRegistrationFee(sdk.NewInt64Coin("uatone", 1)), true},
+		{"registration fee with an empty denom", withRegistrationFee(sdk.Coin{Denom: "", Amount: math.NewInt(1)}), false},
+		{"registration fee with a negative amount", withRegistrationFee(sdk.Coin{Denom: types.DefaultFeesPerBlockDenom, Amount: math.NewInt(-1)}), false},
+		{"registration fee with no amount", withRegistrationFee(sdk.Coin{Denom: types.DefaultFeesPerBlockDenom}), false},
 	}
 
 	for _, tc := range testCases {
@@ -80,6 +104,30 @@ func TestValidateParams(t *testing.T) {
 			require.Nil(t, err, "expected error to be nil for testcase: %s", tc.name)
 		} else {
 			require.NotNil(t, err, "expected error but got nil for testcase: %s", tc.name)
+		}
+	}
+}
+
+func TestValidateFeesPerEpoch(t *testing.T) {
+	cases := []struct {
+		name           string
+		feesPerBlock   math.Int
+		blocksPerEpoch int64
+		expPass        bool
+	}{
+		{"defaults", math.NewInt(types.DefaultFeesPerBlockAmount), types.DefaultBlocksPerEpoch, true},
+		{"product at the bound", math.NewInt(stdmath.MaxInt64 / 600), 600, true},
+		{"product past the bound", math.NewInt(stdmath.MaxInt64/600 + 1), 600, false},
+		{"max int64 over one block", math.NewInt(stdmath.MaxInt64), 1, true},
+		{"amount past int64", math.NewIntFromUint64(stdmath.MaxUint64), 1, false},
+		{"nil amount", math.Int{}, 1, false},
+	}
+	for _, tc := range cases {
+		err := types.ValidateFeesPerEpoch(tc.feesPerBlock, tc.blocksPerEpoch)
+		if tc.expPass {
+			require.NoError(t, err, tc.name)
+		} else {
+			require.Error(t, err, tc.name)
 		}
 	}
 }
@@ -240,5 +288,13 @@ func withInfraction(mutate func(*types.InfractionParameters), fraction ...string
 	if len(fraction) > 0 {
 		p.TrustingPeriodFraction = fraction[0]
 	}
+	return p
+}
+
+// withRegistrationFee returns the default params with the consumer
+// registration fee replaced.
+func withRegistrationFee(fee sdk.Coin) types.Params {
+	p := types.DefaultParams()
+	p.ConsumerRegistrationFee = fee
 	return p
 }

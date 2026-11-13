@@ -6,7 +6,7 @@ modules depend on host wiring they cannot install themselves, and most of that
 wiring fails *silently* when it is missing -- the app builds, boots, syncs, and
 behaves normally until the specific situation the missing piece was protecting
 against arrives. One omission halts the provider chain outright, at an event
-that is guaranteed to happen eventually.
+that is guaranteed to happen eventually; another stops it at its first block.
 
 This document is the checklist. For each duty it states what to wire, what
 breaks without it, and whether the failure is silent, fatal at startup, or a
@@ -22,12 +22,12 @@ be run and tested end to end. Read them as worked examples:
   diff your own app against.
 - **[`app/consumer/app.go`](../app/consumer/app.go) is deliberately reduced.**
   Most visibly it wires **no governance module at all** -- no `govkeeper`, no
-  `gov.NewAppModule`, no gov store key, no gov entry in any module ordering. It
-  imports `govtypes` for one purpose: to derive the authority address string.
-  That is a legitimate choice for a demo chain, and it is exactly why
-  `MsgRecoverClient` is unusable there (see
-  [Governance as the IBC client authority](#4-governance-as-the-ibc-client-authority)).
-  A real consumer chain must not copy that shape.
+  `gov.NewAppModule`, no gov store key, no gov entry in any module ordering.
+  Its authority is the VAAS consumer module account instead, which the
+  consumer's owner acts as through `MsgOwnerExec` (see
+  [The chain's authority](#4-the-chains-authority)). That is a legitimate
+  choice for a chain run by its owner; a consumer with a community of its own
+  wires governance and names it instead.
 
 Both apps also assert `ibctesting.TestingApp` conformance in production code,
 which pulls `ibc-go`'s testing package into the binary. Drop that assertion in a
@@ -50,7 +50,7 @@ No permissions are needed -- the provider module account never mints, burns, or
 stakes. It is a pass-through that money hops through for exactly one step.
 `providertypes.ModuleName` is `"vaasprovider"`.
 
-**Why it is load-bearing.** The fee-pool sweep drains a consumer's whole pool
+**Why it matters.** The fee-pool sweep drains a consumer's whole pool
 balance into the provider module account and fans it back out to depositors in
 the same transaction (`SweepConsumerFeePoolDenom` in
 [x/vaas/provider/keeper/fee_pool_shares.go](../x/vaas/provider/keeper/fee_pool_shares.go)).
@@ -58,8 +58,9 @@ Both hops are wrapped in `panic`, by design: the sweep runs on the consumer
 deletion path, where returning an error would strand the consumer in `STOPPED`
 with no way out, so state corruption is made loud instead of silent.
 
-**The panic path when the entry is missing.** The SDK resolves a module name to
-an address through the permissions map the account keeper was constructed with.
+**The panic path when the entry is missing.** cosmos-sdk's account keeper
+resolves a module name to an address through the permissions map it was
+constructed with.
 With no entry, `GetModuleAddress` returns nil and `bank`'s
 `SendCoinsFromAccountToModule` / `SendCoinsFromModuleToAccount` **panic**
 (`ErrUnknownAddress`, "module account does not exist") before VAAS's own wrappers
@@ -105,7 +106,8 @@ Register it right after constructing the provider keeper.
 `FeePoolSendRestriction`
 ([send_restriction.go](../x/vaas/provider/keeper/send_restriction.go)) rejects
 any bank send addressed at a registered consumer fee-pool address unless the
-sender is the provider or distribution module account.
+sender is the provider or distribution module account, and every send to the
+pool of a deleted consumer.
 
 **Omitting it is silent, and user-triggerable.** Fee-pool addresses are
 deterministic and publicly derivable, so without the restriction anyone can send
@@ -126,14 +128,14 @@ app.StakingKeeper.SetHooks(
 )
 ```
 
-Four of the provider's hook methods carry real behavior; the rest are no-ops:
+Five of the provider's hook methods carry real behavior; the rest are no-ops:
 
 - `AfterValidatorCreated` -- rejects creating a validator whose consensus key is
   already in use as some validator's assigned consumer key. This is the *only*
   enforcement point for that rule at validator creation.
 - `BeforeConsensusPubKeyRotation` -- refuses a consensus-key rotation onto a key
-  already in use as some validator's assigned consumer key, before `x/staking`
-  records the rotation (section 7).
+  already in use as an assigned consumer key, the rotating validator's own
+  included, before `x/staking` records the rotation (section 7).
 - `AfterConsensusPubKeyUpdate` -- after a consensus-key rotation, migrates the
   validator's per-consumer provider-consensus-address-keyed state onto the new
   address (`MigrateStateOnConsPubKeyRotation`) and hands the rotated key to the
@@ -142,6 +144,11 @@ Four of the provider's hook methods carry real behavior; the rest are no-ops:
   [key-assignment.md](key-assignment.md#rotating-your-provider-consensus-key).
 - `AfterValidatorRemoved` -- deletes the removed validator's key assignments and
   reverse mappings.
+- `AfterUnbondingInitiated` -- holds every unbonding operation of a validator
+  with a pending equivocation punishment (its delegators' undelegations from it
+  and redelegations away from it, and its own unbonding), so the deferred slash
+  finds the stake it was queued against
+  ([consumer-refusal.md](consumer-refusal.md) section 3).
 
 **Omitting the hooks is entirely silent.** `ValidatorConsensusKeyInUse`
 ([key_assignment.go](../x/vaas/provider/keeper/key_assignment.go)),
@@ -154,59 +161,131 @@ validator's assigned consumer key silently stops resolving, so cross-chain
 evidence stops attributing to it; its downtime and fee bookkeeping is left
 stranded at the old address, so an epoch's downtime exclusion goes unseen and a
 withheld fee share is never reconciled; consumers learn a rotated key only at the
-next epoch boundary, so the validator accrues missed blocks in the meantime; and
+next epoch boundary, so the validator accrues missed blocks in the meantime;
 key-assignment rows leak for removed validators, keeping a dead validator's old
-consumer address resolvable.
+consumer address resolvable; and stake accused of a consumer double-sign can
+start unbonding unheld while the punishment waits out
+`equivocation_execution_delay`, so the deferred slash finds less than it was
+queued against.
 
 **A wiring hazard specific to this line.** `Keeper.Hooks()` has a pointer
 receiver, so `app.ProviderKeeper.Hooks()` captures `&app.ProviderKeeper`. That
 is what makes it legal to register the hooks *before* assigning the keeper --
 the reference app does exactly that, because the staking keeper must exist first.
-If your app stores the provider keeper in a local variable, or copies it by
-value, the hooks object points at a zero keeper and every hook nil-dereferences.
+Take the hooks from a copy instead (a local variable, a keeper passed by value)
+and they run against that copy: a never-assigned zero keeper nil-dereferences on
+the first hook, and a copy of a constructed keeper shares the store but misses
+whatever is set on the original afterwards, `SetGovKeeper` included (section 12).
 
-## 4. Governance as the IBC client authority
+## 4. The chain's authority
 
 ```go
+consumerAuthority := ibcconsumertypes.OwnerExecAuthority().String()
+
 app.IBCKeeper = ibckeeper.NewKeeper(
     appCodec,
     runtime.NewKVStoreService(keys[ibcexported.StoreKey]),
     app.GetSubspace(ibcexported.ModuleName),
     app.UpgradeKeeper,
-    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    consumerAuthority,
 )
+// ...every other keeper's authority likewise...
+blockedAddrs := app.ModuleAccountAddrs()
+blockedAddrs[consumerAuthority] = true // nothing may fund the account the owner acts as
+app.BankKeeper = bankkeeper.NewBaseKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[banktypes.StoreKey]),
+    app.AccountKeeper,
+    blockedAddrs,
+    consumerAuthority,
+    logger,
+)
+app.ConsumerKeeper.SetMessageRouter(app.MsgServiceRouter())
 ```
 
-Passing the gov module address is only half the job: **a real chain must also
-wire `x/gov` itself**, so that something can actually execute a message signed
-by that address.
+Every keeper takes an `authority`: the one account whose signature its
+authority-gated messages accept. **It must be an account something on the chain
+can act as.** A module address has no private key, so a message signed by it
+only ever comes from a module that executes messages on its behalf: `x/gov`
+for the gov module account, after a passed proposal, or the VAAS consumer
+module for its own account, on its owner's say-so.
 
 **Why VAAS cares.** The only way to replace a dead IBC client on either side is
-ibc-go's governance client recovery, `MsgRecoverClient`, which substitutes the
-client state under the same client id so the consumer's pin and the provider's
-latch both survive it (see [security-model.md](security-model.md)). VAAS routes
+ibc-go's client recovery, `MsgRecoverClient`, which substitutes the client
+state under the same client id so the consumer's pin and the provider's latch
+both survive it (see [security-model.md](security-model.md)). VAAS routes
 operators to it explicitly: `ResumeConsumerChain` pre-flights the client and, if
 it is expired or frozen, fails the resume with instructions to bundle
-`MsgRecoverClient` into the same governance proposal.
+`MsgRecoverClient` into the same governance proposal. `MsgIBCSoftwareUpgrade`,
+`MsgSoftwareUpgrade` and every module's `MsgUpdateParams` are gated the same
+way. ibc-go's `RecoverClient` handler compares `msg.Signer` against the keeper's
+authority and rejects anything else with `ErrUnauthorized`; an authority no one
+can act as makes an expired provider client on the consumer side permanent.
 
-**Omitting governance is silent until recovery is needed, and then terminal.**
-ibc-go's `RecoverClient` handler compares `msg.Signer` against the keeper's
-authority and rejects anything else with `ErrUnauthorized`. That authority is a
-module address with no private key, so the only thing that can produce such a
-message is a passed governance proposal. With no gov module there is no
-`MsgSubmitProposal` route, no proposal, and no recovery: an expired provider
-client on the consumer side is permanent. `MsgIBCSoftwareUpgrade` is gated the
-same way.
+The reference consumer names the consumer module account, and wires
+x/consensus so the block parameters are among what that account governs. Its
+owner (the account that registered the consumer on the provider, which the
+provider seeds into the consumer params) acts as it through `MsgOwnerExec`:
+the owner submits the messages, each signed by the consumer module account,
+and the consumer module executes them in order through the app's message
+router, all or nothing. Nothing else is impersonated: a carried message signed
+by any other account, the gov module's included, is refused, so the owner
+holds exactly the authorities the app grants the consumer module and no more.
+That key is then the chain's only authority: the reference consumer wires no
+governance to replace it, and nothing on the provider pushes a new owner to
+the consumer, so a lost owner key leaves the chain with no authority at all
+(no client recovery, no upgrade, no parameter change; the remedy is a
+coordinated restart from a genesis with a hand-edited `owner_address`). Hold
+it in a multisig, or hand the consumer over to one before launch. The
+consumer module account must be among the bank keeper's blocked addresses
+(the snippet above; `BlockedModuleAccountAddrs` in the reference app), so no
+funds can reach it for the owner to move: on a chain that omits it, whatever
+anyone sends to the authority address becomes the owner's through an exec
+carrying a bank send. The admission and fee rules judge an
+owner exec by the messages it carries (a client recovery is IBC traffic
+whoever submits it; a parameter update is not), and the disabled modules stay
+disabled inside it. `query vaasconsumer owner-authority` prints the account to
+sign with and the owner that may submit.
 
-This is the concrete reason the reference consumer app cannot be used as a
-template here. Note also that the consumer's message filter deliberately allows
-`/cosmos.gov.*` while a consumer is restricted, precisely so governance can
-recover the chain -- an allowance that does nothing if there is no gov module to
-route those messages to.
+An exec is refused if it leaves either of two states behind: the pinned
+provider client tracking a chain id other than the provider's, which a
+recovery could substitute and nothing could move back (so the pin's coherence
+rule holds for its recovery too); or an `owner_address` nobody can sign as,
+empty, undecodable or the consumer module account itself, which would leave
+the chain with no authority for good.
 
-A consumer chain that does not want `x/gov` must pass an authority it can
-actually act as. Passing the conventional gov address and wiring no gov module
-is the one combination that looks correct and cannot work.
+The owner hands the consumer over with the same message: the consumer's
+`owner_address` is a consumer param, carried in a `MsgUpdateParams`, and it is
+seeded once by the provider, so a change of owner on the provider
+(`MsgUpdateConsumer`) does not reach the consumer by itself. **A
+`MsgUpdateParams` carries the full parameter set**, not a diff: every field it
+leaves out is reset (`photon_fees_enabled` to off, `owner_address` to empty,
+which the exec then refuses), and only the two provider-owned downtime fields
+are kept from the store. Read the current set back first with
+`consumerd query vaasconsumer params -o json` and edit it.
+
+**A consumer with a community of its own wires `x/gov` and names the gov module
+account instead.** The owner then holds nothing after the pin. Passing the
+conventional gov address and wiring no gov module is the one combination that
+looks correct and cannot work: it is silent until recovery is needed, and then
+terminal.
+
+**What restricted mode leaves the authority.** While a consumer is in debt or
+its validator set is stale (section 6), on-chain recovery needs only relayer
+traffic, for an expired provider client a client recovery, and for a pinned
+client its creator locked to itself a reset of its allowed relayers: all
+pass, an owner exec carrying `MsgRecoverClient` or `MsgUpdateClientConfig`
+included. A fix that needs new code is
+an off-chain coordinated halt or hard fork, not an on-chain upgrade, so
+restricted mode admits no upgrade and no parameter change (ibc-go's
+`MsgIBCSoftwareUpgrade` and `MsgUpdateParams` included), from the owner or from
+governance: a gov v1 proposal passes only when every message it carries would
+pass on its own, and a legacy content proposal (gov v1beta1
+`MsgSubmitProposal`, or `MsgExecLegacyContent`) is refused, since its content
+cannot be judged. Votes and deposits stay admitted. On a gov-wired consumer, a
+proposal submitted before restricted mode began still executes in `EndBlock`
+when its voting period ends, outside the ante, and restricted mode cannot bound
+it.
 
 ## 5. `x/evidence` on the provider
 
@@ -241,8 +320,10 @@ stake, its bond, and its seat. Note the asymmetry -- *forgetting the
 altogether produces no signal at all.
 
 The consumer app wires no `x/evidence`, correctly: a consumer has no stake to
-slash, and its ante chain blocks `/cosmos.evidence` and `/cosmos.slashing`
-messages outright.
+slash. It registers neither the `x/evidence` nor the `x/slashing` message
+types, so a transaction carrying one fails to decode, and its ante chain
+refuses `/cosmos.evidence` and `/cosmos.slashing` messages outright for a host
+that does register them.
 
 ## 6. The consumer's message-filter decorator
 
@@ -254,6 +335,10 @@ anteDecorators := []sdk.AnteDecorator{
     ante.NewValidateBasicDecorator(),
     consumerante.NewMsgFilterDecorator(options.ConsumerKeeper),
     // ...
+    consumerante.NewPhotonFeeDecorator(options.ConsumerKeeper),
+    ante.NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper,
+        consumerante.NewBootstrapExemptTxFeeChecker(app.ConsumerKeeper)),
+    // ...
 }
 ```
 
@@ -262,14 +347,27 @@ interface (`GetProviderClientID`, `IsConsumerInDebt`, `IsVSCStale`), so a host
 can satisfy it with the consumer keeper or its own adapter. It has three modes
 ([msg_filter_ante.go](../x/vaas/consumer/ante/msg_filter_ante.go)):
 
-- **Before the provider client exists**, only `/ibc.`-prefixed messages are
-  admitted -- the chain can be wired up and nothing else.
-- **While the consumer is in debt or its validator set is stale**, only
-  `/ibc.core.` and `/cosmos.gov.` messages are admitted, rejected otherwise with
-  `ErrConsumerInDebt`. Note the narrower `/ibc.core.` prefix: ICS-20 v1
-  `MsgTransfer` is blocked in this mode, while an ICS-20 v2 transfer riding
-  `/ibc.core.channel.v2.MsgSendPacket` is allowed. `MsgExec` is not unwrapped, so
-  authz-wrapped IBC messages are rejected too.
+- **Before the provider client is pinned**, only `/ibc.`-prefixed messages,
+  `/cosmos.gov.` messages, and the pin itself (`MsgSetProviderClient`) are
+  admitted -- the chain can be wired up and pinned, and nothing else.
+- **While the consumer is in debt or its validator set is stale**, only IBC
+  relayer and client-recovery messages and `/cosmos.gov.` messages are admitted,
+  rejected otherwise with `ErrConsumerInDebt`; a governance proposal passes only
+  when every message it carries would, and a legacy content proposal never does
+  (section 4). The IBC messages are an explicit list of ibc-go v10 core
+  messages, not a prefix: client creation, update (misbehaviour included),
+  upgrade and recovery, the IBC v1 connection and channel handshakes (minus a
+  channel close initiated here) and packet messages, and the IBC v2 counterparty
+  registration, client configuration (`MsgUpdateClientConfig`, the
+  allowed-relayers list a client's creator or the chain's authority sets) and
+  packet messages. ICS-20 v1 `MsgTransfer` is blocked in this
+  mode, and so is the raw ICS-20 v2 transfer riding
+  `/ibc.core.channel.v2.MsgSendPacket`: restricted mode is for recovery, and
+  value stays in. ibc-go's `MsgIBCSoftwareUpgrade` and every `MsgUpdateParams`
+  are refused too. One bank message passes: a `MsgSend` made only of the photon
+  voucher, the path by which a relayer that ran out of vouchers is refilled by
+  any account holding some. `MsgExec` is not unwrapped, so authz-wrapped IBC
+  messages are rejected too.
 - **Otherwise** the transaction passes through untouched.
 
 **Omitting it is silent, and it deletes two whole mechanisms.** `IsVSCStale` and
@@ -284,13 +382,36 @@ traffic. There is no observable symptom until the day it matters.
 Related: `safe_mode_threshold` must be positive. Zero makes `IsVSCStale`
 trivially true and pins the chain in restricted mode forever.
 
+The two fee entries belong together. `NewPhotonFeeDecorator` enforces the
+photon-only fee policy while the `photon_fees_enabled` consumer param is on and
+is a no-op otherwise, so it is wired unconditionally; it sits immediately
+before fee deduction so the denom it vets is the one deducted
+([photon_fee_ante.go](../x/vaas/consumer/ante/photon_fee_ante.go)).
+`NewBootstrapExemptTxFeeChecker(consumerKeeper)` builds the `TxFeeChecker`
+handed to `NewDeductFeeDecorator`: atomone-sdk's minimum-gas-prices floor at
+CheckTx, waived for bootstrap traffic (IBC core minus the raw ICS-20 v2 send,
+governance, the pin) only while no routable provider client is pinned
+([fee_checker.go](../x/vaas/consumer/ante/fee_checker.go)), the same split the
+photon policy makes. A pin set through `MsgSetProviderClient` is routable
+from the start. After the pin everything pays, the relayer included: it is
+funded with vouchers before the pin and runs with a gas price in the voucher
+denom after it ([consumer-launch-runbook.md](consumer-launch-runbook.md)
+section 4). One state reopens the exemption for both: `photon_fees_enabled` on
+and a bank supply of zero for the voucher denom, where no transaction could
+pay and the relayer delivery that would bring the first voucher would be
+refused too. It closes as soon as one voucher exists; vouchers paid as fees
+stay in the fee collector (the reference consumer wires no `x/distribution`)
+and keep it closed. With atomone-sdk's default checker in its place, a floor
+set before the pin would turn the bootstrap traffic away at that node's
+mempool.
+
 ## 7. The provider's consensus-key rotation refusal
 
 The refusal is one of the staking hooks of section 3, not an ante decorator:
 `BeforeConsensusPubKeyRotation` runs from the `MsgRotateConsPubKey` handler,
 before `x/staking` records the rotation, and fails one whose new consensus key
-is already assigned as some validator's consumer key, with
-`ErrConsumerKeyInUse`. It runs wherever the message executes, so a rotation
+is already assigned as a consumer key, by any validator including the rotating
+one and including a key awaiting pruning, with `ErrConsumerKeyInUse`. It runs wherever the message executes, so a rotation
 wrapped in `authz.MsgExec` is covered, and a rejected rotation costs the sender
 its transaction and nothing else.
 
@@ -298,13 +419,17 @@ The hook is the right enforcement point because the staking module applies a
 recorded rotation from `EndBlock`, not from the message handler -- by the time
 VAAS's `AfterConsensusPubKeyUpdate` hook runs, the rotation is already
 committed and there is nothing left to reject. The hook exists in atomone-sdk's
-`x/staking` (upstream has no pre-rotation hook), which the reference apps
-replace the SDK with; a staking module that does not ask it refuses nothing.
+`x/staking` (cosmos-sdk's has no pre-rotation hook), which the reference apps
+build against; a staking module that does not ask it refuses nothing.
 That staking module also charges the rotation fee into the community pool
 through a distribution keeper handed to it after construction
 (`StakingKeeper.SetDistributionKeeper`); without that call every rotation
 fails at the fee step, refused or not, so the hook never gets a rotation to
-admit.
+admit. The fee is the genesis parameter `staking.params.key_rotation_fee`,
+whose default atomone-sdk computes when the package loads, before
+`init --default-denom` changes the bond denom: a genesis made that way prices
+the fee in `stake`, and a rotation then fails at the fee step unless the
+operator holds that denom. Set the fee in the bond denom.
 
 **A staking module that does not ask the hook is silent, and cannot halt the
 chain.** `AfterConsensusPubKeyUpdate` logs the anomaly it can no longer
@@ -321,7 +446,7 @@ to swap the node signing key, and where the validator's state ends up -- see
 ## 8. Module substitutions and ordering on the provider
 
 The provider computes and returns the provider validator set itself, in
-`EndBlock`. The SDK's module manager refuses two producers of validator updates,
+`EndBlock`. The cosmos-sdk module manager refuses two producers of validator updates,
 so the stock staking and genutil modules have to be replaced:
 
 ```go
@@ -330,10 +455,10 @@ no_valupdates_staking.NewAppModule(appCodec, app.StakingKeeper, app.AccountKeepe
     app.BankKeeper, app.GetSubspace(stakingtypes.ModuleName)),
 ```
 
-Both embed the SDK modules and register under the stock module names, so the
-ordering lists still name `stakingtypes.ModuleName` and
-`genutiltypes.ModuleName`. They suppress only the validator-update return values;
-errors still propagate.
+Both embed atomone-sdk's staking and genutil modules and register under the
+stock module names, so the ordering lists still name `stakingtypes.ModuleName`
+and `genutiltypes.ModuleName`. They suppress only the validator-update return
+values; errors still propagate.
 
 **Omitting them is fatal at genesis, with an unhelpful message.** The module
 manager returns "validator InitGenesis updates already set by a previous module"
@@ -352,7 +477,7 @@ Three ordering constraints:
   **silent**: the provider consensus set and every VSC packet lag by one block.
   The reference app places the provider module last.
 - **`SetOrderBeginBlockers`:** `evidencetypes.ModuleName` after slashing and
-  distribution, per the SDK's own convention; the provider module last.
+  distribution, per cosmos-sdk's own convention; the provider module last.
 
 On the consumer, the VAAS consumer module is last in all three orderings and is
 the sole producer of validator updates. It needs neither `no_valupdates`
@@ -402,26 +527,49 @@ pin the rate.
 ## 11. Consumer keeper construction order
 
 The consumer has no staking module: `ConsumerKeeper` stands in as the staking
-keeper for `x/slashing` and `x/genutil`. That creates a genuine circular
-dependency the host must break the same way the reference app does:
+keeper for `x/genutil`, the only module of the reference consumer that asks for
+one. The construction order follows from the arguments: `ibckeeper.NewKeeper`
+first, then `ibcconsumerkeeper.NewKeeper`, which takes the IBC client keepers
+and the IBC v2 channel keeper. ibc-go v10.5's `ibckeeper.NewKeeper` takes
+neither the consumer keeper nor any staking keeper, and panics only on a nil or
+zero upgrade keeper or a blank authority, so the consumer keeper needs no
+placeholder before it.
 
-1. `NewNonZeroKeeper` -- a collections-only consumer keeper, because
-   `ibckeeper.NewKeeper` panics on a zero keeper;
-2. `ibckeeper.NewKeeper`;
-3. the real `ibcconsumerkeeper.NewKeeper`, taking the IBC client and channel
-   keepers and the slashing keeper.
+One order trap, silent: `ibcconsumer.NewAppModule` takes the keeper
+**by value**, so it must be constructed after the keeper is complete; a module
+built from an earlier copy keeps that copy. The provider's `NewAppModule`
+takes a pointer, so order does not matter there -- the two modules differ,
+and it is easy to get backwards.
 
-Skip the pre-initialization and the app panics at startup.
+## 12. The provider's gov keeper
 
-Two further order traps, both silent:
+```go
+app.ProviderKeeper = ibcproviderkeeper.NewKeeper(
+    // ...
+    app.DistrKeeper,
+    nil, // the gov keeper, set below once it exists
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    // ...
+)
+// ... construct app.GovKeeper ...
+app.ProviderKeeper.SetGovKeeper(govadapter.New(app.GovKeeper))
+```
 
-- the slashing keeper must be given `&app.ConsumerKeeper` (a pointer), so the
-  later reassignment is visible to it;
-- `ibcconsumer.NewAppModule` takes the keeper **by value**, so it must be
-  constructed *after* `SetHooks`. Build it earlier and the module holds a
-  pre-hooks copy and the slashing hooks never fire. The provider's
-  `NewAppModule` takes a pointer, so order does not matter there -- the two
-  modules differ, and it is easy to get backwards.
+The provider defers a matured punishment behind a live removal vote for its
+consumer ([consumer-refusal.md](consumer-refusal.md) section 2), and finds that
+vote by reading governance's active-proposals queue. The gov keeper is built
+after the provider keeper in the reference app, so the provider keeper takes
+`nil` for it and is completed with `SetGovKeeper` once governance exists. The
+argument is any `vaastypes.GovKeeper`;
+[x/vaas/provider/govadapter](../x/vaas/provider/govadapter/adapter.go) wraps
+atomone-sdk's gov keeper and is what the reference app passes.
+
+**Omitting it is loud and immediate.** The module's `BeginBlock` checks for the
+gov keeper before anything else and panics at the first block ("provider
+module: no gov keeper wired; call ProviderKeeper.SetGovKeeper in the app"), so
+an app that skips the call never produces a block. The check is there because
+the deferral is a protocol guarantee, not a mode the chain may silently run
+without.
 
 ---
 
@@ -431,15 +579,18 @@ Two further order traps, both silent:
 |---|---|---|
 | `providertypes.ModuleName` in `maccPerms` | **runtime panic, chain halt** | first consumer deletion, in `BeginBlock` -- unrecoverable without a binary fix |
 | `AppendSendRestriction(FeePoolSendRestriction())` | silent, user-triggerable | unattributable fee-pool balance |
-| `ProviderKeeper.Hooks()` on staking | silent | duplicate consumer consensus addresses; orphaned key assignments and stranded downtime/fee bookkeeping after rotation or removal; no immediate post-rotation snapshot |
-| Governance wired *and* set as IBC client authority | silent until recovery is needed, then terminal | `MsgRecoverClient` unreachable; a dead client is permanent |
+| `ProviderKeeper.Hooks()` on staking | silent | duplicate consumer consensus addresses; orphaned key assignments and stranded downtime/fee bookkeeping after rotation or removal; no immediate post-rotation snapshot; accused stake unbonds unheld while an equivocation punishment waits |
+| `ProviderKeeper.SetGovKeeper(...)` | **panic at the first block** | "provider module: no gov keeper wired" |
+| An authority the chain can act as: `x/gov` wired and named, or the consumer module account named with `ConsumerKeeper.SetMessageRouter` | silent until recovery is needed, then terminal | `MsgRecoverClient` unreachable; a dead client is permanent (without the router, every `MsgOwnerExec` fails with "the app wires no message router") |
+| The consumer module account among the bank keeper's blocked addresses | silent | funds sent to the authority address become the owner's through an exec carrying a bank send |
 | `x/evidence` on the provider | silent | provider-native double-signs unpunished |
 | `consumerante.NewMsgFilterDecorator` | silent | safe mode and debt gating cease to exist |
+| `consumerante.NewPhotonFeeDecorator` | silent | the photon-only fee policy ceases to exist; any denom pays |
+| `consumerante.NewBootstrapExemptTxFeeChecker` in `NewDeductFeeDecorator` | silent, per node | a floor set before the pin turns the bootstrap traffic away at that node's mempool |
 | `x/staking` from atomone-sdk, which asks `BeforeConsensusPubKeyRotation` | silent | a colliding rotation succeeds; the validator is dropped from that consumer's set |
 | `no_valupdates_staking` / `no_valupdates_genutil` on the provider | **fatal at genesis** | "validator InitGenesis updates already set by a previous module" |
 | Provider module after staking in `SetOrderEndBlockers` | silent | provider valset and every VSC packet lag one block |
 | Provider module after staking/genutil in `SetOrderInitGenesis` | **fatal at genesis** | "validator set is empty after InitGenesis" |
 | `ibcRouterV2` app-id routes | silent at startup, total at packet time | no VSC or evidence packet routes |
-| Consumer two-phase keeper init | **panic at startup** | `ibckeeper.NewKeeper` on a zero keeper |
 | Provider fee denom | **fatal at startup** if malformed; silent if valid-but-wrong | `NewKeeper` panics, or pools use a denom nobody holds |
-| Consumer module built before `SetHooks` | silent | slashing hooks never fire |
+| Consumer module built from an incomplete keeper | silent | the module keeps the early copy |

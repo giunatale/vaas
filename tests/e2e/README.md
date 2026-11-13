@@ -3,53 +3,72 @@
 Docker-based integration tests that spin up a real provider chain, a real
 consumer chain, and the `ibc-v2-ts-relayer`, then exercise the full VAAS
 lifecycle: consumer registration, genesis bootstrapping, IBC v2 client
-discovery, VSC synchronization, downtime slashing and challenges, fee pooling
-and distribution, key assignment, refusal and punishment deferral, liveness, and
-genesis round-trip.
+declaration, VSC synchronization, downtime slashing and challenges, fee pooling
+and distribution, the photon fee policy and the node fee floor, key assignment,
+the owner's authority on the consumer, refusal and punishment deferral, liveness,
+genesis round-trip, and, on four validator nodes per chain, the validator set
+mirror, a delegation change, an offline validator's slash and recovery, a
+key assignment under a node restart, the refusal threshold, a provider
+consensus key rotation, and a double sign on the provider punished through
+x/evidence; and, against a consumer that lies, the provider's answer to a
+forged downtime accusation, a fabricated double-sign and a fork, followed by
+the recovery from the fork and by a revision bump of the consumer's chain id,
+paused until governance renames and resumes the consumer.
 
-This directory is its own Go module (`tests/e2e/go.mod`) and is excluded from the
-top-level `make test` and from linting. It runs via the `make test-e2e` target
-described below. Docker is required.
+This directory is its own Go module (`tests/e2e/go.mod`), excluded from the
+top-level `make test` and linted by its own target (`make lint-e2e`, which
+`make lint` runs). It runs via the `make test-e2e` target described below.
+Docker is required.
 
 ## Running
 
 ```
 make docker-build-all   # build the chain image (cosmos/vaas-e2e); ts-relayer image is pulled
-make test-e2e           # docker-build-all, then go test in this directory
+make test-e2e           # every suite but the forge one, one at a time, each through test-e2e-suite
+make test-e2e-suite SUITE=TestLivenessIntegrationTestSuite   # one suite, as each CI job runs it
+make test-e2e-forge     # build the forge image too, then run the byzantine-consumer suite
 ```
 
-`make test-e2e`
-([Makefile](../../Makefile) lines 305-322) runs:
+`make test-e2e-suite` ([Makefile](../../Makefile)) builds the image and runs:
 
 ```
-cd tests/e2e && go test -timeout=60m -v ./... --count=1
+cd tests/e2e && go test -timeout=60m -v -run '^$(SUITE)$' ./... --count=1
 ```
+
+It first refuses a `SUITE` that names no top-level test in this directory,
+since `go test -run` passes when it matches nothing. `make test-e2e` lists the
+`Test*Suite` functions and runs each but the byzantine-consumer suite through
+it, so every suite gets its own timeout; a failed suite does not stop the
+others.
 
 The chain image is built from
 [docker/e2e.Dockerfile](docker/e2e.Dockerfile) and contains both the provider
 and consumer binaries. The relayer image is
-`ghcr.io/allinbits/ibc-v2-ts-relayer:latest`, pulled at runtime
-([e2e_tsrelayer_test.go](e2e_tsrelayer_test.go) lines 17-18).
+`ghcr.io/allinbits/ibc-v2-ts-relayer`, pinned by digest in
+[e2e_tsrelayer_test.go](e2e_tsrelayer_test.go) (`tsRelayerImageDigest`, whose
+comment gives the command that bumps it) and pulled at runtime.
 
-To run a single suite:
+CI runs each suite as its own job, in parallel, through `make test-e2e-suite`
+with the suite's top-level test name; the same target runs one suite locally:
 
 ```
-cd tests/e2e && go test -run TestIntegrationTestSuite -v --count=1
-cd tests/e2e && go test -run TestLivenessIntegrationTestSuite -v --count=1
+make test-e2e-suite SUITE=TestIntegrationTestSuite
+make test-e2e-suite SUITE=TestLivenessIntegrationTestSuite
+make test-e2e-suite SUITE=TestLifecycleIntegrationTestSuite
 ```
 
-## The two suites
+## The suites
 
-Both are `testify` suites that embed a shared `baseTestSuite`
+All are `testify` suites that embed a shared `baseTestSuite`
 ([base_suite_test.go](base_suite_test.go)) providing container lifecycle, chain
 init, ts-relayer wiring, and exec/query helpers. Each suite launches its own
 isolated set of containers (distinct chain IDs, Docker network, and host ports)
-so the two can run on the same host without colliding.
+so they can run on the same host without colliding.
 
 ### `IntegrationTestSuite` -- the main suite
 
 Entry point `TestIntegrationTestSuite`
-([e2e_setup_test.go](e2e_setup_test.go) lines 42-44). `SetupSuite` (lines 59+):
+([e2e_setup_test.go](e2e_setup_test.go)). `SetupSuite`, in the same file:
 creates the Docker pool and network, initializes and starts the provider,
 registers a consumer, fetches the consumer genesis from the provider,
 initializes and starts the consumer, then starts the ts-relayer and creates the
@@ -59,10 +78,16 @@ challenge-gated flow completes inside a test run.
 
 The scenarios run as an **ordered** sequence in `TestVAAS`
 ([e2e_test.go](e2e_test.go)); each scenario's doc comment says what it proves,
-and the call-site comments in that list state the ordering constraints. The
+and the call-site comments in that list state the ordering constraints;
+`testOwnerExec` ([e2e_owner_exec_test.go](e2e_owner_exec_test.go)) is the
+owner-authority scenario, a consumer params update through `MsgOwnerExec`
+paid in vouchers, with a user's attempt at the same refused. The
 order matters: later tests depend on consumer `"0"` staying `LAUNCHED` until
-liveness removal, and the genesis round-trip runs last, since it stops the
-provider container and restarts it from exported genesis.
+liveness removal, and the two genesis round-trips run late: the consumer one
+after every scenario that needs consumer-to-provider traffic, the provider one
+once every scenario that needs the consumer is done, since each restarts a
+chain from exported genesis without the history the counterparty's client
+needs to advance.
 
 This suite uses a realistic (~21-day) provider unbonding, so the liveness sweep
 timing is not exercised here -- that is the liveness suite's job.
@@ -70,16 +95,104 @@ timing is not exercised here -- that is the liveness suite's job.
 ### `LivenessIntegrationTestSuite` -- observable liveness timing
 
 Entry point `TestLivenessIntegrationTestSuite`
-([e2e_liveness_suite_test.go](e2e_liveness_suite_test.go) lines 91-93). This
-suite sets `LivenessGraceFraction = 0.75` and a short (200s) unbonding in
-provider genesis so the grace (~150s), safe mode, forced VSC timeout + snapshot
-resync, and auto-sweep removal are all observable within a CI run, while keeping
-the relayer-derived client trusting period viable. It uses fast blocks and a
-first-sync gate to keep the timing-sensitive assertions reliable. Its consumer
-is registered via `testdata/create_consumer_short_unbonding.json`. Scenarios run
-in order in `TestLivenessVAAS`, each with its doc comment;
+([e2e_liveness_suite_test.go](e2e_liveness_suite_test.go)). This suite sets
+`liveness_grace_fraction = 0.375` and a short (600s) unbonding in provider
+genesis so the grace (~225s), safe mode, forced VSC timeout + snapshot resync,
+evidence re-queue after a timeout, and auto-sweep removal are all observable
+within a CI run, while keeping the relayer-derived client trusting period
+viable: the ts-relayer creates each client with two thirds of the tracked
+chain's staking `unbonding_time` (the consumer reports its `unbonding_period`
+there), 400s here. It uses fast blocks and a first-sync gate to keep the
+timing-sensitive assertions reliable. Its consumer is registered via
+`testdata/create_consumer_short_unbonding.json`. Scenarios run in order in
+`TestLivenessVAAS`, each with its doc comment;
 `equivocation_execution_delay` is 420s and the gov voting period 180s here,
 and the header comment of that file documents the timing rationale in detail.
+
+### `MultiValidatorIntegrationTestSuite` -- four validator nodes per chain
+
+Entry point `TestMultiValidatorIntegrationTestSuite`
+([e2e_multival_suite_test.go](e2e_multival_suite_test.go)). The base suite
+starts N validator nodes per chain from `baseSuiteConfig.validators` (one
+consumer node per provider validator, zero or one meaning the single node the
+other suites run); this suite runs four of equal power, on fast blocks and the
+main suite's downtime parameters, with photon fees off. Only val0 of each chain
+binds host ports and holds the keys the suite transacts from; the other nodes
+are reached through `docker exec`. Four is the smallest set where one node can
+stop and both chains keep producing blocks. Scenarios run in order in
+`TestMultiValidatorVAAS`, each leaving the set whole for the next, down to the
+last two: the consensus key rotations hold for the rest of the run, and the
+double sign on the provider tombstones val3.
+
+### `ByzantineConsumerIntegrationTestSuite` -- a consumer that lies
+
+Entry point `TestByzantineConsumerIntegrationTestSuite`
+([e2e_forge_suite_test.go](e2e_forge_suite_test.go)), on four validators like
+the suite above. It runs a consumer that lies three ways, observes the
+provider's answer to each, and drills the recovery from the fork and a
+revision bump, in the one order the protocol allows (downtime evidence and
+misbehaviour are accepted only from a launched consumer):
+
+1. every consumer node runs `consumer-forge` and reports a live validator
+   absent; the provider queues the accusation, a challenge built from the real
+   chain cancels it and pauses the consumer, governance resumes it;
+2. the test signs a double-vote with a validator's key and submits it; the
+   provider jails at once and defers the punishment;
+3. the test signs a fork of the consumer's history with every key; the
+   provider freezes its client and pauses the consumer, punishing nobody, and
+   a resume is refused while the client is frozen;
+4. governance recovers the frozen client onto a substitute and resumes the
+   consumer in one proposal: refused inside the client's trusting period and
+   rolled back, passed once it has elapsed; the consumer is served again,
+   nobody is punished, and the deferred punishment's clock resumes where the
+   pause stopped it;
+5. the consumer restarts under the next revision of its chain id; the
+   provider's client expires and governance recovers it onto a client of the
+   renamed chain; the next provider block pauses the consumer for the chain
+   id mismatch, and it is served nothing until one proposal renames it to the
+   client's chain id and resumes it; a double vote signed over the old chain
+   id below the rename is still accepted;
+6. governance removes the consumer, which cancels the fabricated punishments.
+
+`consumer-forge` ([forge/](forge/)) is the reference consumer app, unchanged,
+behind one lie: within a height range given by its environment
+(`FORGE_ABSENT_ADDRESS`, `FORGE_FROM_HEIGHT`, `FORGE_UNTIL_HEIGHT`) it shows
+the app a validator as absent from blocks it signed. It is its own Go module,
+built only into the `cosmos/vaas-e2e-forge` image (`make docker-build-forge`),
+and only this suite runs it; nothing outside `tests/e2e` knows it exists. The
+suite runs in the `E2E Forge` workflow on every push to main, on demand, and on
+pull requests, where a path filter skips it unless the change touches the code
+whose answer it checks (`make test-e2e-forge` locally); the other e2e jobs
+never build the forge. Branch protection requires the workflow's `Forge paths`
+and `Test E2E Forge` checks; a skipped suite counts as passed.
+
+### `LifecycleIntegrationTestSuite` -- the consumer's end of life
+
+Entry point `TestLifecycleIntegrationTestSuite`
+([e2e_lifecycle_suite_test.go](e2e_lifecycle_suite_test.go)). This suite walks
+one consumer through `PAUSED`, `STOPPED` and `DELETED` on clocks short enough to
+observe: a refusal pause that freezes a pending equivocation punishment across
+its maturity and a governance resume that moves it by the pause's length, the
+withheld-fee record a silent validator's downtime accusation leaves at every
+epoch boundary (made deterministic by an epoch at least four downtime windows
+long) and its lapse once that validator leaves the bonded set (unpaid, one
+challenge window after the last boundary that withheld, with its accusations
+still pending and executing later against its unbonding stake), the
+`max_pause_duration` auto-stop with a third silent validator's frozen record
+lapsing unpaid, double-voting evidence accepted during that pause (its
+punishment executing one delay after the stop, since a lapsed pause is not a
+verdict) and after the stop until a governance removal of the stopped consumer
+cancels the pending punishment and voids later evidence, the owner's fee-pool
+sweep once `STOPPED`, the erasure to `DELETED` after the provider unbonding with
+the chain id released, and the immediate erasure of consumers that never
+launched. Every deadline is checked against the block times at the heights where
+the phase or the queue entry changed (found by bisection over historical
+queries), not the wall clock. The parameters and their rationale are in that
+file's header comment; the scenarios are in
+[e2e_lifecycle_test.go](e2e_lifecycle_test.go) and run in order in
+`TestLifecycleVAAS`. Its consumer is registered via
+`testdata/create_consumer_lifecycle.json` (400s unbonding, 120s safe-mode
+threshold). It takes about 30 minutes.
 
 ## File layout
 
@@ -90,6 +203,24 @@ and the header comment of that file documents the timing rationale in detail.
 | `e2e_setup_test.go` | `IntegrationTestSuite` + its `SetupSuite` / config |
 | `e2e_test.go` | `TestVAAS` ordered scenario list |
 | `e2e_liveness_suite_test.go` | `LivenessIntegrationTestSuite` + `TestLivenessVAAS` |
+| `e2e_multival_suite_test.go` | `MultiValidatorIntegrationTestSuite` + `TestMultiValidatorVAAS` |
+| `e2e_multival_valset_test.go` | the set mirror |
+| `e2e_multival_delegation_test.go` | consumer powers and a delegation reaching the consumer's set |
+| `e2e_multival_key_assignment_test.go` | a key assignment with the node restarted under the new key |
+| `e2e_multival_offline_test.go` | an offline validator's downtime slash and recovery; pending-slash filters |
+| `e2e_multival_refusal_test.go` | the stake-weighted refusal pause threshold, and the resume after withdrawal |
+| `e2e_multival_cons_key_rotation_test.go` | provider consensus key rotations with the node restarted under the new key, behind an assigned key and without one, and the refused rotation onto an assigned key |
+| `e2e_multival_native_double_sign_test.go` | a double sign on the provider handed to CometBFT as evidence and punished through x/evidence |
+| `four_validator_helpers_test.go` | the multi-validator suites' shared genesis, bring-up, validator identities, accusation filter |
+| `e2e_forge_suite_test.go` | `ByzantineConsumerIntegrationTestSuite` + `TestByzantineConsumerVAAS`; the switch to the forge |
+| `e2e_forge_downtime_test.go` | a forged downtime accusation challenged away |
+| `e2e_forge_equivocation_test.go` | a fabricated double-sign: immediate jail, deferred punishment |
+| `e2e_forge_fork_test.go` | a fabricated fork: frozen client, pause, no punishment, refused resume; the recovery and resume, refused inside the trusting period and passed after it |
+| `e2e_forge_revision_bump_test.go` | a revision bump: expired client, recovery, mismatch pause, rename and resume in one proposal, old-id evidence |
+| `e2e_forge_removal_test.go` | the removal that cancels the fabricated punishments |
+| `forge/` | `consumer-forge`, its module, its unit tests and its image |
+| `e2e_lifecycle_suite_test.go` | `LifecycleIntegrationTestSuite` + `TestLifecycleVAAS` |
+| `e2e_lifecycle_test.go` | pause thaw, withheld-fee record and its lapse, auto-stop, double-voting evidence on the paused and stopped consumer, stopped sweep, deletion, pre-launch removal; block-time and historical-query helpers |
 | `e2e_tsrelayer_test.go` | ts-relayer container start/stop, `add-path`, relay control |
 | `e2e_vaas_test.go` | core VSC / valset-sync scenarios |
 | `e2e_debt_test.go` | fee-pool debt-gating scenario |
@@ -97,10 +228,15 @@ and the header comment of that file documents the timing rationale in detail.
 | `e2e_downtime_challenge_test.go` | challenging a queued downtime slash with real consumer chain data |
 | `e2e_fee_pool_test.go` | fee-pool send restriction, locks, gov clawback |
 | `e2e_fee_distribution_test.go` | per-epoch validator payout out of a consumer's fee pool |
+| `e2e_photon_fee_test.go` | photon-only fee policy: native fees rejected, vouchers bridged in while enforcing, voucher fees commit |
+| `e2e_owner_exec_test.go` | the owner's authority on the consumer: a consumer params update through `MsgOwnerExec`, paid in vouchers; a user's attempt refused |
+| `e2e_fee_floor_test.go` | node fee floor in the voucher denom, set by restarting the consumer validator: below-floor rejection at CheckTx, IBC core traffic floored once pinned, relayer paying the floor in vouchers |
 | `e2e_key_assignment_test.go` | consumer key assignment and the consumer switching onto it |
 | `e2e_consumer_liveness_test.go` | liveness / safe-mode scenarios |
 | `e2e_refusal_and_deferral_test.go` | refusal pause and resume, downtime and equivocation deferral behind removal votes, cancellation on removal; fabricated double-vote evidence helpers |
 | `e2e_genesis_roundtrip_test.go` | provider export/restart round-trip |
+| `e2e_consumer_genesis_roundtrip_test.go` | consumer export/restart round-trip at a continuing height |
+| `e2e_evidence_requeue_test.go` | downtime evidence re-queued and accepted after a genuine packet timeout (liveness suite) |
 | `gov_proposal_helpers_test.go` | submit/vote governance proposals from a test |
 | `validator_identity_helpers_test.go` | one validator's address forms across both chains |
 | `genesis_test.go` | genesis-file patching (consumer genesis merge, generic mutation) |
@@ -116,13 +252,21 @@ and the header comment of that file documents the timing rationale in detail.
    a new or existing `e2e_*.go` file. Use the base-suite helpers for container
    exec, chain queries, gov proposals, and ts-relayer control (start, pause,
    resume, `add-path`) rather than driving Docker directly.
-2. Call it from the ordered sequence in `TestVAAS` (or `TestLivenessVAAS`) at
+2. Call it from the ordered sequence in `TestVAAS` (or `TestLivenessVAAS`,
+   or `TestMultiValidatorVAAS` for a scenario that needs several nodes, or
+   `TestLifecycleVAAS`) at
    the right point. Ordering matters: the suite shares one set of containers and
    one consumer across all scenarios, so place your test where the chain is in
    the state it needs, and before anything that tears that state down.
 3. If the scenario needs specific chain configuration, extend the suite's
    `patchProviderGenesis` (or add a `testdata` payload) rather than mutating
    state mid-run.
+
+A new suite (a top-level `Test*Suite` function) also goes into the e2e matrix
+in [.github/workflows/ci.yml](../../.github/workflows/ci.yml), or CI never runs
+it: `make check-e2e-matrix`, a step of CI's Build job, fails while a suite is
+missing from the matrix. The byzantine-consumer suite is the one exception: it
+runs in its own workflow.
 
 The relayer is available at
 <https://github.com/allinbits/ibc-v2-ts-relayer>.

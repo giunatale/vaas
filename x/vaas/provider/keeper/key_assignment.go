@@ -24,10 +24,6 @@ func (k Keeper) ParseConsumerKey(consumerKey string) (tmprotocrypto.PublicKey, e
 		return tmprotocrypto.PublicKey{}, err
 	}
 
-	// Note: the correct way to decide if a key type is supported is to check the
-	// consensus params. That path is disabled for now as a quick way to get
-	// ed25519 working, avoiding amino/proto-any marshalling issues.
-
 	// ed25519 only (docs/key-assignment.md, rule 1): a consumer key must be one
 	// every consumer's CometBFT accepts, and the provider cannot read a consumer's
 	// consensus parameters to check anything else. Widening this is a decision
@@ -55,7 +51,7 @@ func (k Keeper) ParseConsumerKey(consumerKey string) (tmprotocrypto.PublicKey, e
 
 // AssignConsumerKey assigns the consumerKey to the validator with providerAddr on the
 // consumer chain with the given `consumerId`, provided that consumer is registered,
-// initialized, or launched.
+// initialized, launched or paused.
 func (k Keeper) AssignConsumerKey(
 	ctx sdk.Context,
 	consumerId uint64,
@@ -63,10 +59,11 @@ func (k Keeper) AssignConsumerKey(
 	consumerKey tmprotocrypto.PublicKey,
 ) error {
 	if !k.IsConsumerActive(ctx, consumerId) {
-		// check that the consumer chain is either registered, initialized, or launched
+		// Registered, initialized, launched or paused: a paused consumer keeps
+		// its assignments and can be resumed, so they stay editable.
 		return errorsmod.Wrapf(
 			types.ErrInvalidPhase,
-			"cannot assign a key to a consumer chain that is not in the registered, initialized, or launched phase: %d", consumerId)
+			"cannot assign a key to a consumer chain that is not registered, initialized, launched or paused: %d", consumerId)
 	}
 
 	consAddrTmp, err := vaastypes.TMCryptoPublicKeyToConsAddr(consumerKey)
@@ -118,6 +115,18 @@ func (k Keeper) AssignConsumerKey(
 		// reusing a consumer key that it used in the past and is now to be pruned.
 		return errorsmod.Wrapf(
 			types.ErrConsumerKeyInUse, "a validator has or had assigned this consumer key already",
+		)
+	}
+
+	// One assigned key serves one consumer. The same key on a second consumer,
+	// even for the same validator, would let the node that holds it for one
+	// consumer sign for the other, and a punishment it earns there would not
+	// follow the removal of the consumer that caused it. A validator's own
+	// provider key is not an assigned key: reverting to it is allowed on every
+	// consumer (see the default-key check above).
+	if !consumerAddr.ToSdkConsAddr().Equals(providerAddr.ToSdkConsAddr()) && k.IsConsumerConsAddrInUse(ctx, consumerAddr.ToSdkConsAddr()) {
+		return errorsmod.Wrapf(
+			types.ErrConsumerKeyInUse, "the consumer key is already assigned on another consumer",
 		)
 	}
 
@@ -250,16 +259,16 @@ func (k Keeper) ValidatorConsensusKeyInUse(ctx sdk.Context, valAddr sdk.ValAddre
 // assignments. It backs the validator-creation check above, keeping a key
 // already in use as a consumer key from becoming a new validator's provider
 // consensus address -- which would put two validators at the same consensus
-// address on that consumer. The consensus-key-rotation check
-// (Hooks.BeforeConsensusPubKeyRotation) asks IsConsumerConsAddrHeldByAnother
-// instead, since the rotating validator may hold the key itself.
+// address on that consumer. It also backs the consensus-key-rotation check
+// (Hooks.BeforeConsensusPubKeyRotation), which refuses the rotating
+// validator's own assigned keys as well.
 //
 // The scan deliberately spans every consumer that is not deleted rather than
 // only the active ones: a paused consumer keeps all of its key assignments (only
 // DeleteConsumerChain clears them) and can be resumed to LAUNCHED, so a
 // collision created while it is paused would surface the moment it resumes.
 func (k Keeper) IsConsumerConsAddrInUse(ctx sdk.Context, consAddr sdk.ConsAddress) bool {
-	for _, consumerId := range k.nonDeletedConsumerIds(ctx) {
+	for _, consumerId := range k.GetLiveConsumerIds(ctx) {
 		if _, exist := k.GetValidatorByConsumerAddr(ctx, consumerId, types.NewConsumerConsAddress(consAddr)); exist {
 			return true
 		}
@@ -270,37 +279,17 @@ func (k Keeper) IsConsumerConsAddrInUse(ctx sdk.Context, consAddr sdk.ConsAddres
 // IsConsumerConsAddrHeldByAnother reports whether consAddr is assigned as a
 // consumer consensus key by a validator other than the one at providerAddr, on
 // any consumer that is not deleted (the same scan as IsConsumerConsAddrInUse).
-// It backs the consensus-key-rotation check: only two different validators can
-// collide at one consensus address on a consumer (CreateConsumerValidators),
-// and AssignConsumerKey already lets a validator run matching provider and
-// consumer keys, so a validator rotating its provider key onto a consumer key
-// it holds itself, current or superseded, is not refused.
+// AfterConsensusPubKeyUpdate uses it to log a rotation that landed onto
+// another validator's key, the one case that collides on a consumer
+// (CreateConsumerValidators), under a staking module that does not ask
+// BeforeConsensusPubKeyRotation.
 func (k Keeper) IsConsumerConsAddrHeldByAnother(ctx sdk.Context, consAddr sdk.ConsAddress, providerAddr types.ProviderConsAddress) bool {
 	own := providerAddr.ToSdkConsAddr()
-	for _, consumerId := range k.nonDeletedConsumerIds(ctx) {
+	for _, consumerId := range k.GetLiveConsumerIds(ctx) {
 		holder, exist := k.GetValidatorByConsumerAddr(ctx, consumerId, types.NewConsumerConsAddress(consAddr))
 		if exist && !holder.ToSdkConsAddr().Equals(own) {
 			return true
 		}
 	}
 	return false
-}
-
-// nonDeletedConsumerIds returns every consumer whose per-validator state may
-// still be live, i.e. every consumer that has not been deleted. That state
-// outlives the launched phase: key assignments, the stored validator set, and
-// the downtime and fee bookkeeping all survive a pause (which can be resumed)
-// and a stop (until removal completes), and only DeleteConsumerChain clears
-// them. Used by the collision guard above and by
-// MigrateStateOnConsPubKeyRotation.
-func (k Keeper) nonDeletedConsumerIds(ctx sdk.Context) []uint64 {
-	consumerIds := []uint64{}
-	for _, consumerId := range k.GetAllConsumerIds(ctx) {
-		switch k.GetConsumerPhase(ctx, consumerId) {
-		case types.CONSUMER_PHASE_UNSPECIFIED, types.CONSUMER_PHASE_DELETED:
-			continue
-		}
-		consumerIds = append(consumerIds, consumerId)
-	}
-	return consumerIds
 }

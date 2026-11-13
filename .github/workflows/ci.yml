@@ -3,12 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, whatever it targets: a PR stacked on another PR's
+  # branch is reviewed and merged on its own checks too.
   pull_request:
-    branches: [main]
 
+# Pull request runs share one group per PR, so a newer push to the PR cancels
+# the run it supersedes. Push runs get a group per commit: a push to main never
+# waits behind, cancels or is cancelled by another, so every commit on main
+# gets its own verdict.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -24,6 +32,12 @@ jobs:
       - name: Build
         run: make build
 
+      - name: Every e2e suite is in the e2e matrix
+        run: make check-e2e-matrix
+
+      - name: Every go.mod and go.sum is tidy
+        run: make check-tidy
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -36,6 +50,15 @@ jobs:
 
       - name: Lint
         run: make lint
+
+  proto-lint:
+    name: Proto lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Proto lint
+        run: make proto-lint
 
   test:
     name: Test
@@ -50,8 +73,8 @@ jobs:
       - name: Test
         run: make test
 
-  test-e2e:
-    name: Test E2E
+  vulncheck:
+    name: Vulncheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,5 +83,42 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Vulncheck
+        run: make vulncheck
+
+  test-e2e:
+    name: Test E2E (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    # go test bounds a suite at 60 minutes once the chain image is built and
+    # the relayer image pulled; this bounds the whole job.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - TestIntegrationTestSuite
+          - TestLivenessIntegrationTestSuite
+          - TestLifecycleIntegrationTestSuite
+          - TestMultiValidatorIntegrationTestSuite
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
       - name: Run E2E Tests
-        run: make test-e2e
+        run: make test-e2e-suite SUITE=${{ matrix.suite }}
+
+  # Branch protection requires one check named "Test E2E"; the matrix above
+  # reports one per suite. This job carries their combined result under that
+  # name, and runs even when a suite fails so that a failure is reported
+  # rather than a skip.
+  test-e2e-result:
+    name: Test E2E
+    runs-on: ubuntu-latest
+    needs: test-e2e
+    if: always()
+    steps:
+      - name: Every suite passed
+        run: test "${{ needs.test-e2e.result }}" = success

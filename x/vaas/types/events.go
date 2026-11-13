@@ -40,7 +40,9 @@ const (
 	// consumer and pausing it.
 	EventTypeDowntimeChallengeSucceeded = "vaas_downtime_challenge_succeeded"
 	// EventTypeConsumerPaused is emitted when a consumer chain transitions
-	// into CONSUMER_PHASE_PAUSED following a successful downtime challenge.
+	// into CONSUMER_PHASE_PAUSED (see PauseConsumerChain); its reason
+	// attribute names the trigger: a successful downtime challenge, a
+	// confirmed light-client attack, or the refusal threshold.
 	EventTypeConsumerPaused = "vaas_consumer_paused"
 	// EventTypeConsumerResumed is emitted when a paused consumer chain is
 	// resumed via MsgResumeConsumer.
@@ -50,8 +52,28 @@ const (
 	// challenge (see PayWithheldFees).
 	EventTypeWithheldFeePaid = "vaas_withheld_fee_paid"
 
+	// EventTypeOwnerExec is emitted by the consumer when its owner executes
+	// messages as the consumer module account (MsgOwnerExec); the executed
+	// messages' own events carry AttributeOwnerExecMsgIndex.
+	EventTypeOwnerExec = "vaas_owner_exec"
+
+	// EventTypeProviderChainIdFollowed is emitted by the consumer when the
+	// pinned provider client, held Active by ibc-go, tracks a chain id other
+	// than the stored provider chain id and the stored id is re-pinned to it
+	// (see followProviderChainID in the consumer keeper). A tendermint
+	// client's chain id changes only through ibc-go's verified client upgrade
+	// (MsgUpgradeClient adopts the chain id the counterparty committed under
+	// its upgrade path) or a recovery by the chain's authority, so the pinned
+	// client is the proof the provider committed the new id.
+	EventTypeProviderChainIdFollowed = "vaas_provider_chain_id_followed"
+
+	AttributeOwner                    = "owner"
+	AttributeClientId                 = "client_id"
+	AttributeProviderChainId          = "provider_chain_id"
+	AttributePreviousProviderChainId  = "previous_provider_chain_id"
+	AttributeNumMessages              = "num_messages"
+	AttributeOwnerExecMsgIndex        = "owner_exec_msg_index"
 	AttributeKeyAckSuccess            = "success"
-	AttributeKeyAckError              = "error"
 	AttributeWindowEndHeight          = "window_end_height"
 	AttributeProviderValidatorAddress = "provider_validator_address"
 	AttributeConsumerMisbehaviour     = "consumer_misbehaviour"

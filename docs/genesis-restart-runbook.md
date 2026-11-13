@@ -32,9 +32,11 @@ consumer export > consumer_exported.json
 ```
 
 `--height <h>` exports at a specific height. `--for-zero-height` additionally
-scrubs height-relative state (it resets signing-info start heights) for a chain
-that will restart at height 0; use it only for a genuine height-zero relaunch,
-not for a normal halt-and-continue.
+scrubs height-relative state for a chain that will restart at height 0: on the
+provider it resets signing-info start heights; on the consumer, which keeps no
+signing infos, it drops the downtime window in progress, whose bitmaps and
+first-tracked heights are keyed on the old chain's heights. Use it only for a
+genuine height-zero relaunch, not for a normal halt-and-continue.
 
 Always validate an exported (or hand-edited) genesis before starting a node
 from it:
@@ -46,7 +48,16 @@ consumer genesis validate consumer_exported.json
 
 Validation runs the module `GenesisState.Validate` checks. It is a CLI-only
 gate; nodes do not re-run it at boot, so a genesis that skips this step can
-still fail (or panic) at `InitChain`.
+still fail (or panic) at `InitChain`. Both e2e round trips run it on their
+exports, so an export the binaries produce is one they validate; the IBC
+module's step goes through `app/ibcshim` on both reference apps, as `InitChain`
+does, because ibc-go's check rejects the normal `07-tendermint-0` client
+pairing (ibc-go#9063). One rule a hand-edited provider genesis
+can break and a chain-produced export never does: the `consumer_states` ids
+must be exactly `0..n-1` (deleted consumers included, as the export writes
+them). The provider enumerates consumers from its id sequence, so a gap would
+export a phantom consumer and never round-trip; both the CLI and `InitChain`
+reject it.
 
 ## Provider module
 
@@ -54,15 +65,23 @@ still fail (or panic) at `InitChain`.
 
 - the global valset-update-id counter;
 - every consumer's `ConsumerState`: phase, owner, metadata, init params,
-  client id, consumer genesis, pending VSC packets, removal / pause-expiration
-  times, the liveness clock (`LastAckTime`, `HighestSentVscId`,
-  `HighestAckedVscId`), and the in-debt flag;
+  client id, consumer genesis, pending VSC packets, the validator set as last
+  sent to the consumer, removal / pause-expiration times, the pause reason and
+  time, the fork-known-at time and the client-recovered-since-fork mark of a
+  light-client pause, the liveness clock (`LastAckTime`, `HighestSentVscId`,
+  `HighestAckedVscId`), the in-debt flag, and the governance-removal record
+  (`removed_by_governance`, set only on a `STOPPED` consumer) that refuses
+  later double-voting evidence, and the previous chain ids a governance rename
+  retired, each with its boundary height;
+- the refusal signals, the pending equivocation punishments with the
+  unbonding operations held and the jails closed behind them, and the record
+  of punished equivocations;
 - key-assignment state (per-consumer consensus keys, the reverse address index,
   and the addresses-to-prune queue);
 - params, per-consumer `fees_per_block` overrides, and fee-pool shares;
 - the downtime pipeline: pending downtime slashes, accepted-window records,
   window floors, epoch-downtime marks, withheld-fee records, epoch-share
-  records, the infraction params, and the previous-downtime-params snapshot.
+  records, and the previous-downtime-params snapshot.
 
 The in-debt flag is exported rather than re-derived because the only thing that
 recomputes it is the per-epoch fee distribution, which runs at epoch boundaries
@@ -71,28 +90,27 @@ current value, and that stamp is what gates transactions on the consumer, so a
 `PAUSED` consumer resumed before its first post-restart distribution would
 otherwise be sent a snapshot clearing a debt it still owes.
 
-Two things are deliberately **not** exported and are rebuilt at import:
+One thing is deliberately **not** exported and is rebuilt at import:
+**`LastProviderConsensusVals`** (the provider's record of the set it last gave
+CometBFT). `InitGenesis` rebuilds it from the staking module's bonded set --
+the same computation, over the same source, that `EndBlock` runs every block.
+The rebuilt record is exactly the set `InitChain` hands CometBFT, so the first
+post-restart `EndBlock` diffs against a matching baseline and emits no spurious
+update.
 
-- **`LastProviderConsensusVals`** (the provider's record of the set it last gave
-  CometBFT) is rebuilt at `InitGenesis` from the staking module's bonded set --
-  the same computation, over the same source, that `EndBlock` runs every block.
-  The rebuilt record is exactly the set `InitChain` hands CometBFT, so the first
-  post-restart `EndBlock` diffs against a matching baseline and emits no
-  spurious update.
-- **The per-consumer `ConsumerValSet`** (the provider's record of the set each
-  consumer last knew). Instead of exporting it, `QueueVSCPackets` treats an
-  empty stored valset for a launched consumer as *must-snapshot*: the first
-  post-restart epoch sends a full snapshot rather than a diff. This matters
-  because a validator can unbond during the outage; diffing the live bonded set
-  against an empty stored set would emit only additions and never the power-0
-  removal for the departed validator, leaving it with consensus power on the
-  consumer indefinitely. The snapshot reconciles the consumer's set regardless
-  of what it held before. (The same path also covers a consumer's very first
-  epoch, where a snapshot equals the all-additions diff it would produce.)
+The per-consumer validator set is restored as exported, so the next VSC packet
+to each consumer is computed against the set the provider last sent it, as it
+would have been without the restart. `QueueVSCPackets` still treats an empty
+stored set for a launched consumer as *must-snapshot*: that covers a
+consumer's very first epoch, where a snapshot equals the all-additions diff,
+and a hand-built genesis that omits the set, where diffing the live bonded set
+against nothing would emit only additions and never the power-0 removal for a
+validator that left the bonded set.
 
 Also re-derived, from the per-consumer fields above rather than carried
 separately: the spawn-time queue, the removal-time queue, the pause-expiration
-queue, and each launched consumer's equivocation-evidence minimum height.
+queue, and the equivocation-evidence minimum height of each launched, paused, or stopped
+consumer.
 
 ## Consumer module
 
@@ -129,10 +147,13 @@ unpacks the stored key exactly as `x/staking` does.
 
 For a coordinated stop-and-restart (state-export upgrade):
 
-1. Stop the provider and every consumer at the same agreed height (a governance
-   software-upgrade halt, or a coordinated `halt-height`). A clean halt at a
-   shared height keeps the IBC clients and any in-flight packets mutually
-   consistent.
+1. Stop the provider and every consumer at the same agreed height with
+   `halt-height` in each node's `app.toml`. A passed `MsgSoftwareUpgrade` also
+   halts every node at its height, but neither app registers an upgrade
+   handler, so after that halt the binary starts only with
+   `--unsafe-skip-upgrades <height>` on every node; `halt-height` is the
+   mechanism to use. A clean halt at a shared height keeps the IBC clients and
+   any in-flight packets mutually consistent.
 2. On each chain run `export` at that height and `genesis validate` the result.
 3. Assemble the new `genesis.json` for each chain from its exported app state,
    carrying over `chain_id` (or bumping it per your upgrade policy) and the
@@ -140,10 +161,16 @@ For a coordinated stop-and-restart (state-export upgrade):
 4. Distribute the genesis, reset only Tendermint/CometBFT block state
    (`comet unsafe-reset-all` / a fresh data dir), keep validator and node keys,
    and start the new binaries.
-5. Restart the relayer against the same IBC clients. The provider rediscovers
-   each consumer client at the next epoch boundary and, per the must-snapshot
-   rule above, its first post-restart VSC to each launched consumer is a full
-   snapshot.
+5. Restart the relayer against the same IBC clients. The declared client of
+   each consumer is restored with its state and nothing is discovered. The
+   provider's first post-restart VSC to a launched consumer is a full snapshot
+   only if that consumer is behind when it is queued (an earlier packet still
+   unacknowledged or still queued); after a clean stop it is an ordinary diff
+   against the restored set, which still carries the power-0 removal of any
+   validator that left the bonded set since the last epoch. The consumer
+   validator sets are restored too, so accusations that arrive right after the
+   restart are judged against the set the consumer runs, not refused for an
+   empty one.
 
 **The relayer needs the restarted chain's pre-restart history.** Advancing an
 IBC client past the restart requires a client update whose trusted validators
@@ -159,10 +186,36 @@ chain's pre-restart block store queryable by the relayer until its clients have
 advanced past the restart, or replace the stuck clients through the governance
 client-recovery path.
 
+**A provider chain-id change needs no consumer restart.** On the provider it is
+an IBC-aware upgrade: the plan carries an upgraded client state with the new
+chain id (ibc-go's `MsgIBCSoftwareUpgrade`), which ibc-go commits under its
+upgrade path at the halt height, and the restarted provider's genesis carries
+the new `chain_id`. On each consumer the relayer submits ibc-go's
+`MsgUpgradeClient` on the pinned provider client as an ordinary transaction
+(permissionless and admitted in every mode; not inside an owner exec, which
+must leave the pinned client on the stored chain id): ibc-go verifies the
+upgrade against the old chain's commitment, adopts the new chain id and keeps
+the client id, so the pin survives. The consumer's stored provider chain id
+then follows the pinned client on the next VSC packet or owner exec
+(`vaas_provider_chain_id_followed`); the consumer's owner does nothing. Relay
+the upgrade within the pinned client's trusting period, since ibc-go upgrades
+only an active client.
+
 Order the provider and consumers so the relayer can connect promptly after
 start; the consumer safe-mode clock is preserved across the restart, so a long
 gap before VSC traffic resumes is treated exactly as it would have been without
 the restart.
+
+### Stopping a node
+
+Stop a node with `SIGTERM` and give the stop a deadline of about 60 seconds
+before the kill (a systemd unit's `TimeoutStopSec=60`, `docker stop -t 60`). A
+kill at the deadline costs a write-ahead log replay at the next start, from
+which CometBFT recovers. If stops keep running to the deadline, check that the
+supervisor delivers `SIGTERM` to the node process before suspecting the node:
+some container setups do not forward it. Keep a validator's restart short: a
+validator away for more than half a downtime window is accused by the consumer
+(see [consumer-downtime.md](consumer-downtime.md)).
 
 ## Notes
 

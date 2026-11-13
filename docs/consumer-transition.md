@@ -9,18 +9,17 @@
 > non-canonical Cosmos chains may require additional design work.
 
 A standalone-to-consumer transition would let an existing sovereign Cosmos
-chain — one already producing blocks under its own `x/staking` module (or
-equivalent) — swap its local proof-of-stake for the provider's validator set
+chain, one already producing blocks under its own `x/staking` module (or
+equivalent), swap its local proof-of-stake for the provider's validator set
 without a chain-id change, a halt-and-restart, or a fork. The chain would keep
 its account state, balances, and history; it would gain the provider's
 validator set as the consensus signer.
 
 The [`interchain-security`](https://github.com/cosmos/interchain-security)
-implementation supports this path. VAAS inherited a partial copy of the wiring,
-but it was never functional under the IBC-v2-only, `collections`-based rewrite,
-so the dead Go was removed (see *Current code state* below). Only a reserved
-genesis field is kept so the feature can be reintroduced cleanly. We expect
-this transition path to be a requirement in the future.
+implementation supports this path. VAAS carries none of its wiring; it keeps
+two reserved genesis fields so the feature can be added cleanly (see
+*Reserved genesis fields* below). We expect this transition path to be a
+requirement in the future.
 
 ---
 
@@ -78,7 +77,7 @@ users, balances, or contracts.
   set by at least the client's trust level (1/3 by default). A
   standalone-to-consumer transition rotates the validator set wholesale to the
   provider's set, so the overlap is effectively zero and the light client cannot
-  follow the update — it gets stuck at the pre-transition height and any packets
+  follow the update: it gets stuck at the pre-transition height and any packets
   relayed against it fail to verify.
 - Counterparty chains have two recovery paths, both requiring off-chain
   coordination:
@@ -103,8 +102,8 @@ users, balances, or contracts.
 
 ## Requirements for implementation
 
-1. **Genesis-time `preVAAS` flag handling.** The consumer's `InitGenesis` would
-   branch on the reserved `preVAAS` genesis field (still present on
+1. **Genesis-time `pre_vaas` flag handling.** The consumer's `InitGenesis` would
+   branch on the reserved `pre_vaas` genesis field (still present on
    `GenesisState`; see *Current code state*). When set, the consumer module
    would:
    - Skip applying the provider's initial validator set to CometBFT (the local
@@ -119,7 +118,7 @@ users, balances, or contracts.
      while the chain was standalone, even after the provider set takes over.
    The reference would be injected by the app after the keeper constructor (for
    example via a `SetStandaloneStakingKeeper` setter). Neither the field nor the
-   setter exists today — both were removed and would be reintroduced.
+   setter exists today.
 
 3. **Consumer-side staking module.** The consumer app currently wires no staking
    keeper for the consumer module to lean on, so the standalone staking keeper
@@ -129,7 +128,7 @@ users, balances, or contracts.
 4. **Upgrade handler.** The chain operator runs a coordinated software upgrade at
    the transition height that:
    - Adds the VAAS consumer module to the app.
-   - Provides genesis state with `preVAAS = true` and the provider's
+   - Provides genesis state with `pre_vaas = true` and the provider's
      client/consensus state.
    - Stops the local staking module from emitting validator-set updates.
      `x/vaas/no_valupdates_staking` is the wrapper module that does this, but it
@@ -141,7 +140,7 @@ users, balances, or contracts.
    the consumer registered through the standard lifecycle
    (`REGISTERED -> INITIALIZED -> LAUNCHED`) so that by the transition height the
    provider is ready to send VSC packets. The provider would also have to pass
-   `preVAAS = true` in the consumer genesis it builds (today it always passes
+   `pre_vaas = true` in the consumer genesis it builds (today it always passes
    `false`).
 
 6. **Relayer coordination.** The IBC v2 clients must exist on both sides at the
@@ -152,7 +151,7 @@ users, balances, or contracts.
 7. **Counterparty client-recovery coordination.** Every third-party chain that
    runs an IBC light client tracking the transitioning chain must pre-stage a
    `MsgRecoverClient` governance proposal (or a full reconnection runbook)
-   targeting the transition height — see the *For IBC connections to other
+   targeting the transition height; see the *For IBC connections to other
    chains* note above. Without this, existing connections go stale and packet
    traffic halts on those lanes. This is a prerequisite for transition rather
    than a follow-up.
@@ -165,25 +164,25 @@ users, balances, or contracts.
 
 ---
 
-## Current code state
+## Reserved genesis fields
 
 The dead standalone-changeover Go was removed because it was non-functional
 under the current architecture: the consumer app wires no staking keeper for the
 consumer module to use as a standalone staking keeper, so the plumbing was always
-nil, and a hand-crafted `preVAAS = true` genesis would have skipped the
+nil, and a hand-crafted `pre_vaas = true` genesis would have skipped the
 validator-set application and bricked the chain rather than performing a
 changeover.
 
 **Reserved and kept (inert):**
-- `proto/vaas/consumer/v1/genesis.proto` — `GenesisState.preVAAS` (field 5) is
+- `proto/vaas/consumer/v1/genesis.proto`: `GenesisState.pre_vaas` (field 4) is
   kept and documented-reserved. It is deliberately **not** deleted and **not**
   marked with the proto `reserved` keyword, so a future implementation can reuse
   the same field number without a wire-format clash. The consumer keeper does
   not read it today.
-- `proto/vaas/v1/shared_consumer.proto` — `ConsumerGenesisState.preVAAS`
+- `proto/vaas/v1/shared_consumer.proto`: `ConsumerGenesisState.pre_vaas`
   (field 4) is likewise still present and fully inert: nothing validates it and
   nothing sets it anymore (the genesis validation branch and the provider-side
-  `preVAAS = false` pass-through were removed together with the rest of the
+  `pre_vaas = false` pass-through were removed together with the rest of the
   plumbing). The field number is kept so a future implementation can reuse it
   without a wire-format clash.
 **Removed (was dead weight):**
@@ -201,12 +200,15 @@ changeover.
   `GetLastBondedValidators`.
 - The `if state.PreVAAS { ... }` branches in the consumer `InitGenesis`.
 
-Any future implementation will need a fresh design pass: the surrounding flow
-(IBC v2, `cosmossdk.io/collections`, the simplified lifecycle) has changed
-materially since the original ICS implementation, and the consumer app would
-first have to wire a staking module for the residual local set. Treat the ICS
-sources below as a sketch of the data dependencies, not a guide to the control
-flow.
+The `ConsumerGenesisState.Provider.initial_val_set` field is a different
+thing and is in use: `InitGenesis` applies it to build the VAAS validator set
+on both the new-chain and restart paths.
+
+An implementation needs a fresh design pass: the surrounding flow (IBC v2,
+`cosmossdk.io/collections`, the simplified lifecycle) differs materially from
+the ICS implementation, and the consumer app would first have to wire a
+staking module for the residual local set. Treat the ICS sources below as a
+sketch of the data dependencies, not a guide to the control flow.
 
 ---
 

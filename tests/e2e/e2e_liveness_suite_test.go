@@ -5,8 +5,10 @@ package e2e
 // period is unbonding * LivenessGraceFraction; this suite sets the fraction to
 // 0.375 in provider genesis so the grace (~225s) is observable within a CI run,
 // while keeping a long-enough provider/consumer unbonding (600s) that the
-// relayer-derived IBC client trusting period (unbonding * 0.66 = ~396s) stays
-// viable. Shrinking the grace via a short unbonding instead would collapse the
+// relayer-derived IBC client trusting period stays viable: the ts-relayer
+// creates each client with two thirds of the tracked chain's staking
+// unbonding_time (the consumer reports its unbonding_period there), 400s
+// here. Shrinking the grace via a short unbonding instead would collapse the
 // trusting period and the relayer could never establish the clients.
 //
 // Two infrastructure measures keep the timing-sensitive assertions reliable:
@@ -51,7 +53,18 @@ package e2e
 //                                and the consumer re-queues the evidence (per
 //                                window) instead of losing it, and the provider
 //                                eventually accepts both windows.
-//   6. testAutoSweepRemoval    - relayer stopped indefinitely; poll until STOPPED.
+//   6. testQueueEquivocationBeforeLivenessStop - bonds an equivocating validator
+//                                and queues a fabricated punishment against it
+//                                right before the sweep stops the consumer.
+//   7. testAutoSweepRemoval    - relayer stopped indefinitely; poll until STOPPED.
+//   8. testEquivocationSurvivesLivenessStop - the stop was no verdict: the
+//                                punishment is still pending and executes at
+//                                maturity (tombstone, slash).
+//   9. testDeferredEquivocationCancelledByVotePassedAfterStop - a punishment
+//                                maturing during a removal vote submitted after
+//                                the stop defers behind it; the vote passes (gov
+//                                records the proposal FAILED, the consumer being
+//                                STOPPED already) and cancels it.
 //
 // The STOPPED -> DELETED edge (deletion at stop-time + unbonding) is unit-tested
 // (TestSweepRemovesStaleConsumer), not exercised here -- see the note above
@@ -92,7 +105,7 @@ const (
 // LivenessIntegrationTestSuite mirrors IntegrationTestSuite with two key
 // differences:
 //   - provider genesis is patched with unbonding_time "600s" and
-//     liveness_grace_fraction "0.375" (grace ~225s, trusting period ~396s)
+//     liveness_grace_fraction "0.375" (grace ~225s, trusting period 400s)
 //   - consumer is registered via create_consumer_short_unbonding.json
 //     (600s unbonding, 20s vaas_timeout, 5s safe_mode_threshold)
 type LivenessIntegrationTestSuite struct {
@@ -141,7 +154,7 @@ func (s *LivenessIntegrationTestSuite) SetupSuite() {
 			// Long enough for a removal vote submitted after the liveness stop
 			// to still be open when the mid-outage punishment matures (see
 			// testDeferredEquivocationCancelledByVotePassedAfterStop).
-			s.genesisSection(appState, "gov", "params")["voting_period"] = "180s"
+			s.setGovVotingPeriod(appState)
 
 			params := s.genesisSection(appState, "vaasprovider", "params")
 			// One block per epoch so a VSC packet (and its ack) flows every
@@ -166,8 +179,8 @@ func (s *LivenessIntegrationTestSuite) SetupSuite() {
 			// Shrink the liveness grace fraction so the grace period
 			// (unbonding * fraction = 600s * 0.375 = ~225s) is observable in
 			// a CI run, while keeping the unbonding itself long enough that
-			// the relayer-derived IBC client trusting period (unbonding *
-			// 0.66 = ~396s) clears the declaration check: the declared
+			// the relayer-derived IBC client trusting period (two thirds of
+			// the unbonding, 400s) clears the declaration check: the declared
 			// consumer client's trusting period must exceed the downtime
 			// challenge horizon (180s + 180s below).
 			//
@@ -361,11 +374,10 @@ func (s *LivenessIntegrationTestSuite) testRecoverBeforeGrace() {
 //
 // Delivery is frozen by *pausing the relayer container* (docker pause), not by
 // purging and rebuilding it. The distinction is essential: a rebuild runs
-// add-path, which creates brand-new IBC clients. The provider, however, keeps
-// using its already-discovered client as long as that client stays Active and
-// has a counterparty (see discoverActiveConsumerClient) -- which it does for
-// the ~132s trusting period. So a rebuild would leave the provider sending VSCs
-// to the original, now-unrelayed client and the consumer would never recover
+// add-path, which creates brand-new IBC clients that nobody declares. The
+// provider sends only over the client the owner declared, permanently (see
+// SetConsumerClient), so a rebuild would leave the provider sending VSCs to
+// the original, now-unrelayed client and the consumer would never recover
 // within grace. Pausing the relayer leaves the original client untouched, so on
 // unpause the relay loop resumes on the same client and delivery continues. It
 // also keeps the outage short, decoupling this consumer-side test from the
@@ -750,10 +762,11 @@ func (s *LivenessIntegrationTestSuite) testEquivocationSurvivesLivenessStop() {
 
 // testDeferredEquivocationCancelledByVotePassedAfterStop: lqval2's punishment,
 // queued mid-outage, matures during a removal vote submitted after the
-// liveness stop, so it defers behind that vote. The vote passes, but its
-// MsgRemoveConsumer finds the consumer already STOPPED and gov records the
-// proposal FAILED; the tally is still the community's verdict, so the deferred
-// punishment is cancelled: entry gone, no tombstone, jail opened.
+// liveness stop, so it defers behind that vote instead of executing. The vote
+// passes and its MsgRemoveConsumer executes against the STOPPED consumer as
+// governance's verdict on its evidence: the deferred punishment is cancelled
+// at the tally (entry gone, no tombstone, jail opened) and the consumer stays
+// STOPPED.
 func (s *LivenessIntegrationTestSuite) testDeferredEquivocationCancelledByVotePassedAfterStop() {
 	s.Run("equivocation: a removal vote passed after the liveness stop cancels the deferred punishment", func() {
 		const consumerID = "0"
@@ -768,23 +781,19 @@ func (s *LivenessIntegrationTestSuite) testDeferredEquivocationCancelledByVotePa
 		s.Require().Truef(time.Until(entry.ExecutesAt) > 30*time.Second,
 			"lqval2's maturity (%s) must fall inside the vote about to be submitted", entry.ExecutesAt)
 
-		s.T().Log("submitting a removal proposal against the stopped consumer: the vote passes, the removal cannot execute...")
+		s.T().Log("submitting a removal proposal against the stopped consumer: the vote passes and the removal records the verdict...")
 		proposalID := s.submitProposalWithVote(
 			s.removalProposalJSON(consumerID, "Remove consumer (liveness e2e, passes after the stop)"),
-			"yes", "PROPOSAL_STATUS_FAILED")
+			"yes", "PROPOSAL_STATUS_PASSED")
+		s.T().Logf("removal proposal %d passed against the stopped consumer", proposalID)
+		s.Require().Truef(time.Now().After(entry.ExecutesAt),
+			"lqval2's maturity (%s) must have passed during the vote, so only the deferral kept it from executing", entry.ExecutesAt)
 
-		pending = s.mustPendingEquivocations(consumerID)
-		s.Require().Len(pending, 1, "the punishment waits for the verdict at its extended maturity")
-		s.Require().True(pending[0].Extended, "the punishment must have deferred behind the vote")
-		s.Require().Equal(strconv.FormatUint(proposalID, 10), pending[0].DeferredByProposalId,
-			"the punishment must record the vote it deferred behind")
-
-		s.T().Log("waiting for the deferred punishment to be cancelled at its extended maturity...")
-		s.Require().Eventuallyf(func() bool {
-			return s.pendingEquivocationsEmpty(consumerID)
-		}, time.Until(pending[0].ExecutesAt)+2*time.Minute, 5*time.Second,
-			"the punishment was not cancelled after the passed vote")
+		s.Require().True(s.pendingEquivocationsEmpty(consumerID),
+			"the removal of the stopped consumer must cancel the deferred punishment")
 		s.Require().False(s.signingInfoTombstoned(s.lqval2ConsAddr), "a cancelled punishment must not tombstone")
+		s.Require().Equal("CONSUMER_PHASE_STOPPED", s.queryProviderConsumerPhase(consumerID),
+			"the removal leaves a stopped consumer stopped")
 
 		s.T().Log("unjailing lqval2 now that the cancelled punishment opened the jail...")
 		s.mustUnjail("lqval2", s.lqval2Valoper)

@@ -57,10 +57,10 @@ the unbonding period) exactly as a governance removal would do. See
 [consumer-lifecycle.md](consumer-lifecycle.md) for the `STOPPED -> DELETED` mechanics.
 
 The sweep only considers `LAUNCHED` consumers. A paused consumer (a successful downtime
-challenge, or a refusal coalition at the pause threshold) is deliberately silent, so the sweep
-skips it; its pause has its own deadline
-(`MaxPauseDuration`), and a governance resume reseeds `lastAck` so the grace budget restarts
-fresh. See [consumer-downtime.md](consumer-downtime.md).
+challenge, a confirmed light-client attack, a refusal coalition at the pause threshold, or a
+declared client tracking another chain id) is deliberately silent, so the sweep skips it;
+its pause has its own deadline (`MaxPauseDuration`), and a governance resume reseeds
+`lastAck` so the grace budget restarts fresh. See [consumer-downtime.md](consumer-downtime.md).
 
 **Guarantee:** a launched-but-unresponsive consumer is removed within the grace period,
 which is strictly less than the provider's unbonding period. So every validator that was in
@@ -77,14 +77,14 @@ a set it cannot be sure the consumer holds. When queueing the epoch's packet it 
 - **An earlier packet is unacknowledged.** The provider tracks two per-consumer counters: the
   highest VSC id it has **sent** and the highest the consumer has **acked**. The consumer is
   **behind** when `highestAcked < highestSent`.
-- **A packet is still queued locally.** A send that never went out -- a client not yet
-  discovered, or a prior send that failed -- leaves pending packets queued and `highestSent`
-  unadvanced, so the acked/sent comparison alone would not catch it.
+- **A packet is still queued locally.** A send that never went out -- a client the owner
+  has not declared yet, or a prior send that failed -- leaves pending packets queued and
+  `highestSent` unadvanced, so the acked/sent comparison alone would not catch it.
 - **The stored consumer validator set is empty.** There is nothing to diff against: the
-  consumer's first epoch, or the first epoch after a state-export restart, since the provider
-  does not export the per-consumer set. Diffing the live bonded set against an empty stored
-  set would emit only additions, never the power-0 removal for a validator that unbonded in
-  between, leaving it with consensus power on the consumer.
+  consumer's first epoch, or a hand-built genesis that omits the set (an export carries it, so
+  a state-export restart diffs against the set the provider last sent). Diffing the live bonded
+  set against an empty stored set would emit only additions, never the power-0 removal for a
+  validator that unbonded in between, leaving it with consensus power on the consumer.
 
 A snapshot carries the complete current validator set, flagged with `is_snapshot = true` on
 the packet. The consumer, on receiving a snapshot, **replaces** its set with it -- setting each
@@ -126,22 +126,49 @@ be strictly below the provider's liveness grace, enforced at `MsgCreateConsumer`
 the provider's sweep would remove it.
 
 While stale (or while flagged in debt for unpaid fees), the consumer's transaction admission
-gate restricts incoming transactions to `/ibc.core.*` and `/cosmos.gov.*` messages only,
-rejecting value-bearing application transactions. This bounds the damage of a possibly-stale
-set: the consumer refuses to do value-bearing work under a validator set it cannot trust,
-while keeping the recovery path open -- `/ibc.core.*` still admits the incoming VSC packets
-that let the consumer resync, and `/cosmos.gov.*` keeps governance available. The staleness
-clock is armed at genesis on a new chain, so a consumer that never receives a single VSC --
-say its relayer never materializes -- enters safe mode once the threshold elapses from chain
-start, instead of running on its genesis validator set unrestricted forever; the relayer
-traffic that would deliver the first VSC is `/ibc.core.*` and passes the gate throughout.
+gate restricts incoming transactions to IBC relayer and client-recovery messages (an explicit
+list of ibc-go core messages: client creation, update (misbehaviour included), upgrade and
+recovery, connection and channel handshakes, packet delivery, acknowledgement and timeout, IBC
+v2 counterparty registration), `/cosmos.gov.*` messages, and bank `MsgSend`s made only of the
+photon voucher, rejecting every other transaction: the raw ICS-20 v2 send
+(`/ibc.core.channel.v2.MsgSendPacket`) and ibc-go's software upgrade and parameter updates
+included. This bounds the damage of a possibly-stale set: the consumer refuses most
+value-bearing work under a validator set it cannot trust, and no value leaves it, while keeping
+the recovery path open -- the IBC list still admits the incoming VSC packets that let the
+consumer resync and a client recovery (`MsgRecoverClient`, an owner exec carrying it included),
+and `/cosmos.gov.*` keeps a wired governance module's votes and deposits available. A
+governance proposal passes only when every message it carries would pass on its own, and a
+legacy content proposal never does, so neither governance nor the owner can upgrade the chain
+or change its parameters in safe mode: a fix that needs new code is an off-chain coordinated
+halt or hard fork. A proposal submitted before safe mode began still executes when its voting
+period ends, outside the gate. The voucher send is the one value transfer admitted: on a
+consumer with `photon_fees_enabled` the relayer pays its deliveries in the voucher, and a
+relayer that ran out is refilled by any account holding vouchers. The rule cannot tell a refill
+from any other voucher payment between two accounts, so voucher payments keep working in safe
+mode, and the vouchers stay on the chain. The staleness clock is armed at genesis on a new
+chain, so a consumer that never receives a single VSC -- say its relayer never materializes --
+enters safe mode once the threshold elapses from chain start, instead of running on its genesis
+validator set unrestricted forever; the relayer traffic that would deliver the first VSC is on
+the IBC list and passes the gate throughout.
+
+On a photon-fees consumer, that relayer traffic also pays its fee in the voucher once the
+provider client is pinned, so the relayer's voucher balance is part of the recovery path.
+The reference consumer wires no `x/distribution`: every voucher paid as a fee stays in the
+fee collector for good, and the relayer's balance only goes down. A relayer that runs out
+cannot deliver its own refill, VSC delivery stops, and the consumer drifts into safe mode
+and towards removal until some account holding vouchers sends it more. If no account holds
+spendable vouchers any more, no transaction can pay a fee and the consumer has no on-chain
+way out. Keep the relayer funded, or keep a second, voucher-funded relayer account; see the
+[launch runbook](consumer-launch-runbook.md) section 6. Only a consumer with no voucher at
+all (bank supply zero) gets bootstrap infrastructure traffic waived from the fee gates again,
+until one voucher arrives.
 
 ## 5. Parameters and bounds
 
 | Parameter | Where | Bound | Default |
 |---|---|---|---|
 | `VaasTimeoutPeriod` | provider module param (VSC packet timeout) and per-consumer init param (consumer evidence packet timeout) | `(0, MaxTimeoutDelta (24h)]` | 1h |
-| consumer `UnbondingPeriod` | per-consumer init param | `(0, providerUnbondingPeriod]` | provider default minus 1 day |
+| consumer `UnbondingPeriod` | per-consumer init param | `(0, providerUnbondingPeriod]`, and `UnbondingPeriod * TrustingPeriodFraction > DowntimeEvidenceMaxAge + DowntimeChallengeWindow` | provider default minus 1 day |
 | `LivenessGraceFraction` | provider module param | `(0, 1)` | `0.66` |
 | consumer `SafeModeThreshold` | per-consumer init param | `(0, provider liveness grace)` | 3h |
 
@@ -154,9 +181,13 @@ consumer is handled by the liveness sweep, so a short timeout is not dangerous.
 
 The consumer `UnbondingPeriod` is bounded against the provider's at `MsgCreateConsumer` /
 `MsgUpdateConsumer` time (it must not exceed the provider's), so a consumer cannot be
-configured to outlive the provider's slashable window. No lower floor is enforced: an
-unbonding short enough to make the relayer-derived trusting period impractical is an
-operator concern (and is useful for short-lived test or dev chains), not a protocol minimum.
+configured to outlive the provider's slashable window. Its floor comes from the downtime
+challenge: the declared client's trusting period must exceed the challenge horizon
+(`DowntimeEvidenceMaxAge + DowntimeChallengeWindow`), so `UnbondingPeriod *
+TrustingPeriodFraction` must exceed it at registration, or no client of the consumer could
+ever be declared. With the defaults (a 10-day horizon, a 0.66 fraction) that is an unbonding
+period above about 15.2 days; a short-lived test or dev chain lowers the two downtime
+windows first.
 
 The consumer `SafeModeThreshold` is bounded at the same `MsgCreateConsumer` /
 `MsgUpdateConsumer` boundary: it must be strictly less than the provider's liveness grace
@@ -198,8 +229,9 @@ before `removal_eta`, it will be stopped.
   the provider's slashable window -- never on a single transient packet failure.
 - A consumer that recovers within the grace period self-heals to the provider's exact
   validator set via snapshot resync, with no operator or governance action.
-- While a consumer's set may be stale, it refuses value-bearing transactions but keeps the
-  IBC recovery path open.
+- While a consumer's set may be stale, it refuses value-bearing transactions other than
+  photon voucher sends between its own accounts, lets no value leave, and keeps the IBC
+  recovery path open.
 
 **Out of scope (candidates for follow-up work)**
 

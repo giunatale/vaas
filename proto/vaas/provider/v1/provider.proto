@@ -6,11 +6,9 @@ import "amino/amino.proto";
 import "cosmos_proto/cosmos.proto";
 import "gogoproto/gogo.proto";
 import "cosmos/base/v1beta1/coin.proto";
-import "cosmos/evidence/v1beta1/evidence.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "ibc/core/client/v1/client.proto";
-import "ibc/lightclients/tendermint/v1/tendermint.proto";
 import "vaas/v1/wire.proto";
 import "tendermint/crypto/keys.proto";
 
@@ -30,7 +28,8 @@ message Params {
 
   // LivenessGraceFraction sets the consumer liveness grace period as a fraction
   // of the provider unbonding period (grace = unbonding * fraction). A consumer
-  // with no successful VSC acknowledgement for longer than the grace is removed.
+  // with no successful VSC acknowledgement for longer than the grace is
+  // removed.
   string liveness_grace_fraction = 2;
 
   // Sent IBC packets will timeout after this duration
@@ -93,6 +92,13 @@ message Params {
   // downtime SLA window, the challenge window and the evidence max age.
   InfractionParameters infraction_parameters = 11
       [ (gogoproto.nullable) = false ];
+
+  // ConsumerRegistrationFee is charged to the submitter of MsgCreateConsumer
+  // and burned, so registering consumers has a cost beyond gas. It must be
+  // denominated in the per-block fee denom when its amount is positive; a
+  // zero amount disables it.
+  cosmos.base.v1beta1.Coin consumer_registration_fee = 12
+      [ (gogoproto.nullable) = false, (amino.dont_omitempty) = true ];
 }
 
 // AddressList contains a list of consensus addresses
@@ -163,9 +169,11 @@ message ConsensusValidator {
   // when a validator joined a given consumer, and it is the durable one: it
   // persists for as long as the validator stays in the set, whereas the
   // consumer's first-seen heights are local to that consumer and cleared
-  // every time a downtime window closes. It is state only, and is not carried
-  // in module genesis, in any query response, or in any packet the provider
-  // sends.
+  // every time a downtime window closes. Module genesis carries it, inside
+  // ConsumerState.validator_set; it appears in no query response and in no
+  // packet the provider sends. After a --for-zero-height restart it holds a
+  // height of the chain that was exported, not of the restarted one, until
+  // the validator leaves the set and rejoins.
   int64 join_height = 4;
 }
 
@@ -222,7 +230,9 @@ message ConsumerInitializationParameters {
   // a VAAS enabled consumer chain, the VAAS module acts as the staking module.
   int64 historical_entries = 7;
   // How long the consumer may go without receiving a VSC packet before its
-  // tx admission gate enters safe mode (only ibc.core and gov messages pass).
+  // tx admission gate enters restricted mode, which admits IBC relayer and
+  // client-recovery traffic, governance (a new proposal only when every
+  // message it carries is such traffic), and photon voucher refills.
   google.protobuf.Duration safe_mode_threshold = 8
       [ (gogoproto.nullable) = false, (gogoproto.stdduration) = true ];
 }
@@ -277,8 +287,14 @@ enum PauseReason {
   // consumer forked (MsgSubmitConsumerMisbehaviour).
   PAUSE_REASON_LIGHT_CLIENT_ATTACK = 2;
   // REFUSAL_THRESHOLD: the bonded power refusing the consumer reached
-  // RefusalPauseThreshold (MsgSetConsumerRefusal, see EvaluateConsumerRefusals).
+  // RefusalPauseThreshold (MsgSetConsumerRefusal, see
+  // EvaluateConsumerRefusals).
   PAUSE_REASON_REFUSAL_THRESHOLD = 3;
+  // CLIENT_CHAIN_ID_MISMATCH: the consumer's declared client tracks a chain
+  // id other than the consumer's (an ibc-go client upgrade or recovery
+  // switched it), so the provider cannot judge the consumer's
+  // evidence (see PauseConsumersWithMismatchedClients).
+  PAUSE_REASON_CLIENT_CHAIN_ID_MISMATCH = 4;
 }
 
 // InfractionParameters is the part of Params that governs consumer-sourced
@@ -386,7 +402,8 @@ message WithheldFeeRecord {
       [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
 }
 
-//
+// SlashJailParameters is the slash fraction, jail duration and tombstone flag
+// applied to one infraction type.
 message SlashJailParameters {
   bytes slash_fraction = 1 [
     (cosmos_proto.scalar) = "cosmos.Dec",

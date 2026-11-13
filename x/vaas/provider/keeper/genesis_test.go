@@ -9,7 +9,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	abci "github.com/cometbft/cometbft/abci/types"
+
 	clienttypes "github.com/cosmos/ibc-go/v10/modules/core/02-client/types"
+	ibctmtypes "github.com/cosmos/ibc-go/v10/modules/light-clients/07-tendermint"
 
 	"cosmossdk.io/collections"
 	"cosmossdk.io/math"
@@ -283,7 +286,7 @@ func TestInitGenesisRestoresPerConsumerStateAndDerivedQueues(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, md, gotMd)
 
-	// init_params are set on INITIALIZED, LAUNCHED, STOPPED, DELETED (ids 1–4).
+	// init_params are set on INITIALIZED, LAUNCHED, STOPPED, DELETED (ids 1 to 4).
 	for _, consumerId := range []uint64{1, 2, 3, 4} {
 		gotIp, err := pk.GetConsumerInitializationParameters(ctx, consumerId)
 		require.NoError(t, err, "init_params missing for consumer %d", consumerId)
@@ -364,10 +367,10 @@ func TestGenesisRoundTrip(t *testing.T) {
 		pkA.SetConsumerPhase(ctxA, id, s.phase)
 		pkA.SetConsumerOwnerAddress(ctxA, id, owner)
 		require.NoError(t, pkA.SetConsumerMetadata(ctxA, id, md))
-		// init_params present for INITIALIZED..DELETED (every phase except REGISTERED).
-		if s.phase != providertypes.CONSUMER_PHASE_REGISTERED {
-			require.NoError(t, pkA.SetConsumerInitializationParameters(ctxA, id, ip))
-		}
+		// init_params present in every phase: CreateConsumer stores them
+		// (defaulted when the message carries none), so a REGISTERED consumer
+		// has them too.
+		require.NoError(t, pkA.SetConsumerInitializationParameters(ctxA, id, ip))
 		// A deleted consumer holds no chain id: its teardown released it (see
 		// DeleteConsumerChain), so seed the state deletion actually leaves.
 		if s.phase == providertypes.CONSUMER_PHASE_DELETED {
@@ -409,7 +412,7 @@ func TestGenesisRoundTrip(t *testing.T) {
 	pruneTs := time.Unix(1_900_000_000, 0).UTC()
 	prunedAddr := providertypes.NewConsumerConsAddress([]byte("consumer-addr-to-prune-x"))
 
-	// Seed on consumer 2 (LAUNCHED — has a populated state to assign keys against).
+	// Seed on consumer 2 (LAUNCHED, with a populated state to assign keys against).
 	const keyedConsumerID uint64 = 2
 	pkA.SetValidatorConsumerPubKey(ctxA, keyedConsumerID, assignedProviderConsAddr, assignedConsumerKey)
 	pkA.SetValidatorByConsumerAddr(ctxA, keyedConsumerID, assignedConsumerConsAddr, assignedProviderConsAddr)
@@ -420,6 +423,24 @@ func TestGenesisRoundTrip(t *testing.T) {
 	require.NoError(t, pkA.SetConsumerLastAckTime(ctxA, keyedConsumerID, time.Unix(1_850_000_000, 0).UTC()))
 	pkA.SetConsumerHighestSentVscId(ctxA, keyedConsumerID, 7)
 	pkA.SetConsumerHighestAckedVscId(ctxA, keyedConsumerID, 5)
+
+	// A packet still in the send queue and the validator set as last sent:
+	// the first is what the next epoch's snapshot decision reads, the second
+	// is what evidence is judged against from the first post-restart block.
+	setValidator := cryptotestutil.NewCryptoIdentityFromIntSeed(77)
+	setKey := setValidator.TMProtoCryptoPublicKey()
+	queuedPacket := vaastypes.ValidatorSetChangePacketData{
+		ValidatorUpdates: []abci.ValidatorUpdate{{PubKey: setKey, Power: 10}},
+		ValsetUpdateId:   7,
+	}
+	pkA.AppendPendingVSCPackets(ctxA, keyedConsumerID, queuedPacket)
+	lastSentSet := []providertypes.ConsensusValidator{{
+		ProviderConsAddr: setValidator.SDKValConsAddress().Bytes(),
+		Power:            10,
+		PublicKey:        &setKey,
+		JoinHeight:       3,
+	}}
+	require.NoError(t, pkA.SetConsumerValSet(ctxA, keyedConsumerID, lastSentSet))
 
 	// Seed the debt flag on the PAUSED consumer: nothing re-derives it for a
 	// consumer outside LAUNCHED, and a resume queues an immediate snapshot VSC
@@ -474,6 +495,12 @@ func TestGenesisRoundTrip(t *testing.T) {
 		collections.Join(keyedConsumerID, time.Unix(1_700_000_001, 0).UTC().UnixNano()), math.NewInt(500)))
 	require.NoError(t, pkA.EpochShareRecords.Set(ctxA,
 		collections.Join(otherConsumerID, time.Unix(1_700_000_002, 0).UTC().UnixNano()), math.NewInt(700)))
+	// An epoch distribution recorded at the end of the downtime window
+	// delivered to the re-imported keeper below, past the default grace
+	// period after spawnAt, so that accusation prices its slash from an
+	// exported record.
+	accusedWindowEnd := spawnAt.Add(8 * 24 * time.Hour)
+	pkA.SetEpochShareRecord(ctxA, keyedConsumerID, accusedWindowEnd, math.NewInt(1000))
 
 	// Seed one WithheldFeeRecords / EpochDowntime entry, two
 	// AcceptedDowntimeWindows records for the same pair, and one
@@ -580,7 +607,7 @@ func TestGenesisRoundTrip(t *testing.T) {
 	}}, expA.PunishedEquivocations)
 	require.NotNil(t, expA.PreviousDowntimeParams)
 	require.Equal(t, previousDowntimeParams, *expA.PreviousDowntimeParams)
-	require.Len(t, expA.EpochShareRecords, 2)
+	require.Len(t, expA.EpochShareRecords, 3)
 	require.Len(t, expA.WithheldFeeRecords, 1)
 	require.Equal(t, withheldFeeRecord, expA.WithheldFeeRecords[0])
 	require.ElementsMatch(t, []providertypes.AcceptedDowntimeWindowRecord{
@@ -653,7 +680,7 @@ func TestGenesisRoundTrip(t *testing.T) {
 
 	// After import, the consumer-id-keyed key-assignment state must reconnect
 	// to the same consumer id; this is the bug guard for the proto rename
-	// (chain_id → consumer_id on ValidatorConsumerPubKey / ValidatorByConsumerAddr
+	// (chain_id to consumer_id on ValidatorConsumerPubKey / ValidatorByConsumerAddr
 	// / ConsumerAddrsToPrune).
 	gotKey, foundKey := pkB.GetValidatorConsumerPubKey(ctxB, keyedConsumerID, assignedProviderConsAddr)
 	require.True(t, foundKey, "ValidatorConsumerPubKey lost across round-trip")
@@ -734,6 +761,11 @@ func TestGenesisRoundTrip(t *testing.T) {
 
 	// The debt flag must reconnect too, and only for the consumer that carried
 	// it -- this is what buildVSCPacket stamps onto the next VSC packet.
+	require.Equal(t, []vaastypes.ValidatorSetChangePacketData{queuedPacket}, pkB.GetPendingVSCPackets(ctxB, keyedConsumerID),
+		"pending VSC packets lost across round-trip")
+	gotSet, err := pkB.GetConsumerValSet(ctxB, keyedConsumerID)
+	require.NoError(t, err)
+	require.Equal(t, lastSentSet, gotSet, "the consumer validator set lost across round-trip")
 	require.True(t, pkB.IsConsumerInDebt(ctxB, pausedConsumerID),
 		"consumer debt flag lost across round-trip")
 	require.False(t, pkB.IsConsumerInDebt(ctxB, keyedConsumerID),
@@ -751,6 +783,38 @@ func TestGenesisRoundTrip(t *testing.T) {
 	})
 
 	require.Equal(t, expA, expB, "round-trip must be a fixed point")
+
+	// A downtime accusation naming the restored validator is judged against
+	// the imported set from the restarted provider's first block: with the
+	// window-end anchor and the client's trusting period supplied the way
+	// the downtime tests supply them, keeper B accepts it and queues the
+	// priced slash. The restored params (window 30, min signed 0.5) put the
+	// threshold at 15 missed; 24 of 30 clears it.
+	accuseCtx := ctxB.WithBlockTime(accusedWindowEnd)
+	pkB.OverrideWindowEndTimestampForTest(func(_ sdk.Context, _ string, _ int64) (time.Time, error) {
+		return accusedWindowEnd, nil
+	})
+	stakingB.MockClientKeeper.EXPECT().GetClientState(gomock.Any(), "07-tendermint-0").
+		Return(&ibctmtypes.ClientState{ChainId: "consumer-gamma", TrustingPeriod: 365 * 24 * time.Hour}, true).AnyTimes()
+	stakingB.MockPhotonKeeper.EXPECT().ConversionRate(accuseCtx).Return(math.LegacyNewDec(2), nil)
+
+	restoredAddr := setValidator.SDKValConsAddress()
+	// windowStart 61, span 30 => window end height 90.
+	accusation := vaastypes.NewEvidencePacketData(
+		restoredAddr, 61, []byte{0xFF, 0xFF, 0xFF, 0x00}, 30,
+		customInfractionParams.SignedBlocksWindow, customInfractionParams.MinSignedPerWindow,
+	)
+	require.NoError(t, pkB.HandleConsumerEvidencePacket(accuseCtx, keyedConsumerID, accusation))
+
+	restoredPending, err := pkB.PendingDowntimeSlashes.Get(accuseCtx,
+		collections.Join3(keyedConsumerID, restoredAddr.Bytes(), int64(90)))
+	require.NoError(t, err, "an accusation naming a restored validator must queue a pending slash")
+	require.Equal(t, int64(61), restoredPending.WindowStartHeight)
+	require.Equal(t, int64(24), restoredPending.MissedCount)
+	// P = 1000 from the record at the window end, M = 24/30, C = 2:
+	// 1000 * 0.8 / 2 = 400.
+	require.True(t, math.NewInt(400).Equal(restoredPending.SlashTokens), "expected 400, got %s", restoredPending.SlashTokens)
+	require.Equal(t, accusedWindowEnd.Add(customInfractionParams.DowntimeChallengeWindow), restoredPending.MaturesAt)
 }
 
 // TestGenesisRoundTrip_PreservesFeesPerBlockOverrides verifies that
@@ -843,7 +907,7 @@ func TestGenesisState_Validate_OverrideRejections(t *testing.T) {
 	owner := sdk.AccAddress([]byte("vaas-test-owner-1234")).String()
 	md := providertypes.ConsumerMetadata{Name: "n", Description: "d", Metadata: "m"}
 	knownConsumer := providertypes.ConsumerState{
-		ConsumerId: 1, ChainId: "test-1", Phase: providertypes.CONSUMER_PHASE_REGISTERED,
+		ConsumerId: 0, ChainId: "test-1", Phase: providertypes.CONSUMER_PHASE_REGISTERED,
 		OwnerAddress: owner, Metadata: &md,
 	}
 
@@ -864,19 +928,19 @@ func TestGenesisState_Validate_OverrideRejections(t *testing.T) {
 		{
 			name:       "malformed amount",
 			consumers:  []providertypes.ConsumerState{knownConsumer},
-			override:   providertypes.ConsumerFeesPerBlockOverride{ConsumerId: 1, Amount: "garbage"},
+			override:   providertypes.ConsumerFeesPerBlockOverride{ConsumerId: 0, Amount: "garbage"},
 			wantErrMsg: "not a valid integer",
 		},
 		{
 			name:       "negative amount is below the floor",
 			consumers:  []providertypes.ConsumerState{knownConsumer},
-			override:   providertypes.ConsumerFeesPerBlockOverride{ConsumerId: 1, Amount: "-1"},
+			override:   providertypes.ConsumerFeesPerBlockOverride{ConsumerId: 0, Amount: "-1"},
 			wantErrMsg: "must be greater than",
 		},
 		{
 			name:       "positive amount below the floor",
 			consumers:  []providertypes.ConsumerState{knownConsumer},
-			override:   providertypes.ConsumerFeesPerBlockOverride{ConsumerId: 1, Amount: "500"},
+			override:   providertypes.ConsumerFeesPerBlockOverride{ConsumerId: 0, Amount: "500"},
 			wantErrMsg: "must be greater than",
 		},
 	}
@@ -969,8 +1033,11 @@ func TestInitGenesis_RebuildsDerivedCollections(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), cid)
 
-	_, err = k.FeePoolAddressToConsumerId.Get(ctx, k.GetConsumerFeePoolAddress(1))
-	require.ErrorIs(t, err, collections.ErrNotFound)
+	// The deleted consumer's reverse lookup is rebuilt too, so the send
+	// restriction keeps refusing sends to its pool after a restart.
+	cid, err = k.FeePoolAddressToConsumerId.Get(ctx, k.GetConsumerFeePoolAddress(1))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), cid)
 }
 
 // TestInitGenesisPanicsOnNilDowntimeSlashFraction verifies that InitGenesis
@@ -993,6 +1060,43 @@ func TestInitGenesisPanicsOnNilDowntimeSlashFraction(t *testing.T) {
 	require.Contains(t, fmt.Sprint(recovered), "slash_fraction")
 }
 
+// TestInitGenesisPanicsOnNonContiguousConsumerIds verifies that InitGenesis
+// halts on consumer ids that are not exactly 0..n-1: the keeper derives every
+// consumer id from the ConsumerId sequence, so a gap would export a phantom
+// consumer with no phase, chain id, or owner, and the export would never
+// validate again. GenesisState.Validate rejects the same genesis for the CLI.
+func TestInitGenesisPanicsOnNonContiguousConsumerIds(t *testing.T) {
+	owner := sdk.AccAddress([]byte("vaas-test-owner-1234")).String()
+	consumer := func(id uint64, chainId string) providertypes.ConsumerState {
+		return providertypes.ConsumerState{
+			ConsumerId: id, ChainId: chainId, Phase: providertypes.CONSUMER_PHASE_REGISTERED, OwnerAddress: owner,
+		}
+	}
+
+	for name, states := range map[string][]providertypes.ConsumerState{
+		"a gap":          {consumer(0, "chain-a"), consumer(2, "chain-b")},
+		"not from zero":  {consumer(1, "chain-a")},
+		"a duplicate id": {consumer(0, "chain-a"), consumer(0, "chain-b")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			k, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+			defer ctrl.Finish()
+
+			gs := providertypes.DefaultGenesisState()
+			gs.ConsumerStates = states
+			require.Error(t, gs.Validate())
+
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				k.InitGenesis(ctx, gs)
+			}()
+			require.NotNil(t, recovered)
+			require.Contains(t, fmt.Sprint(recovered), "contiguous")
+		})
+	}
+}
+
 // TestInitGenesisAcceptsDefaultGenesis verifies that the infraction-parameter
 // check in InitGenesis accepts the module's own default genesis state.
 func TestInitGenesisAcceptsDefaultGenesis(t *testing.T) {
@@ -1006,8 +1110,10 @@ func TestInitGenesisAcceptsDefaultGenesis(t *testing.T) {
 }
 
 // TestGenesisRoundTripKeepsPauseReasonAndPausedAt: the reason a consumer is
-// paused for and the time it was paused at travel through export, validation
-// and import, and a launched consumer carries neither.
+// paused for, the time it was paused at and, for a light-client pause, the
+// time the fork became known and whether the client was recovered since
+// travel through export, validation and import, and a launched consumer
+// carries none of them.
 func TestGenesisRoundTripKeepsPauseReasonAndPausedAt(t *testing.T) {
 	pkA, ctxA, ctrlA, mocksA := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrlA.Finish()
@@ -1039,7 +1145,8 @@ func TestGenesisRoundTripKeepsPauseReasonAndPausedAt(t *testing.T) {
 		return id
 	}
 
-	// consumer 0: paused after a light-client containment.
+	// consumer 0: paused for a refusal, then moved under the light-client
+	// reason when its client froze.
 	paused := seed("consumer-alpha", providertypes.CONSUMER_PHASE_PAUSED, "07-tendermint-0")
 	pauseExpiresAt := time.Unix(1_820_000_000, 0).UTC()
 	require.NoError(t, pkA.SetConsumerPauseExpirationTime(ctxA, paused, pauseExpiresAt))
@@ -1047,6 +1154,9 @@ func TestGenesisRoundTripKeepsPauseReasonAndPausedAt(t *testing.T) {
 	require.NoError(t, pkA.SetConsumerPauseReason(ctxA, paused, providertypes.PAUSE_REASON_LIGHT_CLIENT_ATTACK))
 	pausedAt := time.Unix(1_816_000_000, 0).UTC()
 	require.NoError(t, pkA.SetConsumerPausedAt(ctxA, paused, pausedAt))
+	forkKnownAt := time.Unix(1_817_000_000, 0).UTC()
+	require.NoError(t, pkA.SetConsumerForkKnownAt(ctxA, paused, forkKnownAt))
+	require.NoError(t, pkA.SetConsumerClientRecoveredSinceFork(ctxA, paused))
 
 	// consumer 1: launched, never paused.
 	launched := seed("consumer-beta", providertypes.CONSUMER_PHASE_LAUNCHED, "07-tendermint-1")
@@ -1056,8 +1166,12 @@ func TestGenesisRoundTripKeepsPauseReasonAndPausedAt(t *testing.T) {
 	require.Len(t, expA.ConsumerStates, 2)
 	require.Equal(t, providertypes.PAUSE_REASON_LIGHT_CLIENT_ATTACK, expA.ConsumerStates[0].PauseReason)
 	require.Equal(t, &pausedAt, expA.ConsumerStates[0].PausedAt)
+	require.Equal(t, &forkKnownAt, expA.ConsumerStates[0].ForkKnownAt)
+	require.True(t, expA.ConsumerStates[0].ClientRecoveredSinceFork)
 	require.Equal(t, providertypes.PAUSE_REASON_UNSPECIFIED, expA.ConsumerStates[1].PauseReason)
 	require.Nil(t, expA.ConsumerStates[1].PausedAt)
+	require.Nil(t, expA.ConsumerStates[1].ForkKnownAt)
+	require.False(t, expA.ConsumerStates[1].ClientRecoveredSinceFork)
 
 	pkB, ctxB, ctrlB, mocksB := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrlB.Finish()
@@ -1071,9 +1185,20 @@ func TestGenesisRoundTripKeepsPauseReasonAndPausedAt(t *testing.T) {
 	got, err := pkB.GetConsumerPausedAt(ctxB, paused)
 	require.NoError(t, err)
 	require.Equal(t, pausedAt, got)
+	got, err = pkB.GetConsumerForkKnownAt(ctxB, paused)
+	require.NoError(t, err)
+	require.Equal(t, forkKnownAt, got)
+	recovered, err := pkB.IsConsumerClientRecoveredSinceFork(ctxB, paused)
+	require.NoError(t, err)
+	require.True(t, recovered)
 	require.Equal(t, providertypes.PAUSE_REASON_UNSPECIFIED, pkB.GetConsumerPauseReason(ctxB, launched))
 	_, err = pkB.GetConsumerPausedAt(ctxB, launched)
 	require.Error(t, err)
+	_, err = pkB.GetConsumerForkKnownAt(ctxB, launched)
+	require.Error(t, err)
+	recovered, err = pkB.IsConsumerClientRecoveredSinceFork(ctxB, launched)
+	require.NoError(t, err)
+	require.False(t, recovered)
 }
 
 // TestInitGenesisPanicsOnWithheldFeeDenomMismatch: the record denom is fixed
@@ -1108,4 +1233,84 @@ func TestInitGenesisPanicsOnWithheldFeeDenomMismatch(t *testing.T) {
 
 	require.Panics(t, func() { pk.InitGenesis(ctx, gs) },
 		"a withheld record in a denom the module does not charge must fail InitChain")
+}
+
+// TestGenesisRoundTripKeepsTheGovernanceRemovalRecord: the verdict that
+// voids a consumer's equivocation evidence survives a restart, and a
+// consumer stopped for another reason comes back without it.
+func TestGenesisRoundTripKeepsTheGovernanceRemovalRecord(t *testing.T) {
+	pkA, ctxA, ctrlA, mocksA := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrlA.Finish()
+	pkA.SetParams(ctxA, providertypes.DefaultParams())
+	pkA.SetValidatorSetUpdateId(ctxA, 1)
+
+	owner := sdk.AccAddress([]byte("vaas-test-owner-1234")).String()
+	md := providertypes.ConsumerMetadata{Name: "n", Description: "d", Metadata: "m"}
+	ip := providertypes.ConsumerInitializationParameters{
+		InitialHeight:     clienttypes.Height{RevisionNumber: 0, RevisionHeight: 42},
+		GenesisHash:       []byte("g"),
+		BinaryHash:        []byte("b"),
+		SpawnTime:         time.Unix(1_700_000_000, 0).UTC(),
+		UnbondingPeriod:   time.Hour,
+		VaasTimeoutPeriod: time.Hour,
+		HistoricalEntries: 10,
+	}
+	cg := launchedConsumerGenesis()
+	removeAt := time.Unix(1_830_000_000, 0).UTC()
+	seedStopped := func(chainId, clientId string) uint64 {
+		id := pkA.FetchAndIncrementConsumerId(ctxA)
+		pkA.SetConsumerChainId(ctxA, id, chainId)
+		pkA.SetConsumerPhase(ctxA, id, providertypes.CONSUMER_PHASE_STOPPED)
+		pkA.SetConsumerOwnerAddress(ctxA, id, owner)
+		require.NoError(t, pkA.SetConsumerMetadata(ctxA, id, md))
+		require.NoError(t, pkA.SetConsumerInitializationParameters(ctxA, id, ip))
+		pkA.SetConsumerClientId(ctxA, id, clientId)
+		require.NoError(t, pkA.SetConsumerGenesis(ctxA, id, cg))
+		pkA.SetEquivocationEvidenceMinHeight(ctxA, id, ip.InitialHeight.RevisionHeight)
+		require.NoError(t, pkA.SetConsumerRemovalTime(ctxA, id, removeAt))
+		require.NoError(t, pkA.AppendConsumerToBeRemoved(ctxA, id, removeAt))
+		return id
+	}
+	removed := seedStopped("consumer-alpha", "07-tendermint-0")
+	pkA.MarkConsumerRemovedByGovernance(ctxA, removed)
+	swept := seedStopped("consumer-beta", "07-tendermint-1")
+
+	expA := pkA.ExportGenesis(ctxA)
+	require.NoError(t, expA.Validate(), "export must validate")
+	require.True(t, expA.ConsumerStates[0].RemovedByGovernance)
+	require.False(t, expA.ConsumerStates[1].RemovedByGovernance)
+
+	pkB, ctxB, ctrlB, mocksB := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrlB.Finish()
+	mocksA.MockStakingKeeper.EXPECT().GetBondedValidatorsByPower(gomock.Any()).Return(nil, nil).AnyTimes()
+	mocksB.MockStakingKeeper.EXPECT().GetBondedValidatorsByPower(gomock.Any()).Return(nil, nil).AnyTimes()
+	mocksB.MockBankKeeper.EXPECT().GetAllBalances(gomock.Any(), gomock.Any()).Return(sdk.NewCoins()).AnyTimes()
+	_ = pkB.InitGenesis(ctxB, expA)
+
+	require.True(t, pkB.IsConsumerRemovedByGovernance(ctxB, removed))
+	require.False(t, pkB.IsConsumerRemovedByGovernance(ctxB, swept))
+
+	// The record belongs to a stopped consumer only.
+	expA.ConsumerStates[1].Phase = providertypes.CONSUMER_PHASE_LAUNCHED
+	expA.ConsumerStates[1].RemovedByGovernance = true
+	require.ErrorContains(t, expA.Validate(), "only set on a stopped consumer")
+}
+
+// TestInitGenesisPanicsOnRegistrationFeeOutsideTheFeeDenom: the genesis
+// parameters go through the keeper's check, so a positive consumer
+// registration fee in a denom other than the fee denom halts InitChain.
+func TestInitGenesisPanicsOnRegistrationFeeOutsideTheFeeDenom(t *testing.T) {
+	k, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+
+	gs := providertypes.DefaultGenesisState()
+	gs.Params.ConsumerRegistrationFee = sdk.NewInt64Coin("uatone", 1)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		k.InitGenesis(ctx, gs)
+	}()
+	require.NotNil(t, recovered)
+	require.Contains(t, fmt.Sprint(recovered), "is not the fee denom")
 }

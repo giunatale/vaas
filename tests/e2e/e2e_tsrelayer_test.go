@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	tsRelayerImage    = "ghcr.io/allinbits/ibc-v2-ts-relayer"
-	tsRelayerImageTag = "latest"
-	IBCv2             = "2"
+	tsRelayerImage = "ghcr.io/allinbits/ibc-v2-ts-relayer"
+	// The index digest (linux/amd64 and linux/arm64) of the relayer image the
+	// suites run; bump it from `docker buildx imagetools inspect ghcr.io/allinbits/ibc-v2-ts-relayer:latest`.
+	tsRelayerImageDigest = "sha256:4f61a9e711a4ffa29910aadecf56bf47f0426d6139f791dac06d04485007d8ca"
+	IBCv2                = "2"
 )
 
 type tsRelayerPath struct {
@@ -35,17 +37,42 @@ func noRestart(config *docker.HostConfig) {
 	config.RestartPolicy = docker.RestartPolicy{Name: "no"}
 }
 
+// pullTSRelayerImage pulls the relayer image tsRelayerImageDigest pins, unless
+// the daemon already holds it, tags it locally under the digest hex and returns
+// that tag. dockertest joins RunOptions.Repository and Tag with a colon, so a
+// digest reference cannot be handed to RunWithOptions; the local tag names the
+// pinned image through it.
+func (s *baseTestSuite) pullTSRelayerImage() string {
+	ref := tsRelayerImage + "@" + tsRelayerImageDigest
+	if _, err := s.dkrPool.Client.InspectImage(ref); err != nil {
+		s.T().Logf("pulling %s", ref)
+		err := s.dkrPool.Client.PullImage(docker.PullImageOptions{Repository: ref}, docker.AuthConfiguration{})
+		s.Require().NoError(err, "failed to pull the ts-relayer image")
+	}
+	tag := strings.TrimPrefix(tsRelayerImageDigest, "sha256:")
+	err := s.dkrPool.Client.TagImage(ref, docker.TagImageOptions{Repo: tsRelayerImage, Tag: tag})
+	s.Require().NoError(err, "failed to tag the ts-relayer image")
+	return tag
+}
+
 func (s *baseTestSuite) startTSRelayer() {
 	s.T().Log("starting ts-relayer container")
 
+	tag := s.pullTSRelayerImage()
+	// The image's command is a relay process. The harness runs the one relay
+	// process it watches and restarts itself (startTSRelayerRelay), so the
+	// container only idles, under the image's entrypoint: that keeps the
+	// keyring session bus, which every exec'd relayer command joins, alive
+	// for the container's life.
 	resource, err := s.dkrPool.RunWithOptions(
 		&dockertest.RunOptions{
-			Name:       fmt.Sprintf("%s-%s-ts-relayer", s.cfg.providerChainID, s.cfg.consumerChainID),
+			Name:       s.tsRelayerContainerName(),
 			Repository: tsRelayerImage,
-			Tag:        tsRelayerImageTag,
+			Tag:        tag,
 			NetworkID:  s.dkrNet.Network.ID,
 			User:       "root",
 			CapAdd:     []string{"IPC_LOCK"},
+			Cmd:        []string{"tail", "-f", "/dev/null"},
 		},
 		noRestart,
 	)
@@ -143,7 +170,10 @@ func (s *baseTestSuite) launchTSRelayerRelayProcess() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	cmd := []string{"/bin/with_keyring", "ibc-v2-ts-relayer", "relay"}
+	// The relay process writes to the container's log, where the harness
+	// reads it (tsRelayerLogLines); a detached exec's own output goes
+	// nowhere.
+	cmd := []string{"sh", "-c", "exec /bin/with_keyring ibc-v2-ts-relayer relay >/proc/1/fd/1 2>/proc/1/fd/2"}
 	exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
 		Context:      ctx,
 		AttachStdout: true,
@@ -198,8 +228,9 @@ func (s *baseTestSuite) tsRelayerRelayReadsKeyring(logMark int) bool {
 	return false
 }
 
-// killTSRelayerRelayProcess stops a running relay process inside the relayer
-// container so it can be started again on a fresh keyring session.
+// killTSRelayerRelayProcess stops the relay process started by
+// launchTSRelayerRelayProcess so it can be started again on a fresh keyring
+// session; nothing else in the container runs under that command line.
 func (s *baseTestSuite) killTSRelayerRelayProcess() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -318,6 +349,31 @@ func (s *baseTestSuite) tsRelayerAddPath(ibcVersion string) {
 		"--st", "cosmos",
 		"--dt", "cosmos",
 		"--ibc-version", ibcVersion,
+	})
+}
+
+// tsRelayerAddExistingPath registers an IBC v2 path on clients the chains
+// already hold: providerClientID on the provider and consumerClientID on the
+// consumer, each the other's registered counterparty. The relay process
+// adopts the path on its next cycle, once the provider-side client tracks
+// the chain id the consumer node reports; it scans the path's packets from
+// genesis, so any in-flight backlog is delivered.
+func (s *baseTestSuite) tsRelayerAddExistingPath(providerClientID, consumerClientID string) {
+	s.T().Logf("ts-relayer: adding IBCv2 path on the existing clients %s (%s) and %s (%s)",
+		providerClientID, s.cfg.providerChainID, consumerClientID, s.cfg.consumerChainID)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	s.executeTSRelayerCommand(ctx, []string{
+		"add-existing-path",
+		"-s", s.cfg.providerChainID,
+		"-d", s.cfg.consumerChainID,
+		"--surl", "http://" + s.providerValRes[0].Container.Name[1:] + ":26657",
+		"--durl", "http://" + s.consumerValRes[0].Container.Name[1:] + ":26657",
+		"--sclient", providerClientID,
+		"--dclient", consumerClientID,
+		"--st", "cosmos",
+		"--dt", "cosmos",
+		"--ibc-version", IBCv2,
 	})
 }
 

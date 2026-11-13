@@ -24,24 +24,30 @@ import (
 // collections (spawn-time queue, removal-time queue, equivocation evidence
 // min height) are then reconstructed in a second pass from the per-consumer
 // fields. After all consumers are imported, the ConsumerId sequence counter
-// is advanced past the highest imported id so subsequent MsgCreateConsumer
-// calls do not collide with the imported records.
+// is set to their number, the ids being exactly 0..n-1, so subsequent
+// MsgCreateConsumer calls do not collide with the imported records.
 func (k Keeper) InitGenesis(ctx sdk.Context, genState *types.GenesisState) []abci.ValidatorUpdate {
 	k.SetValidatorSetUpdateId(ctx, genState.ValsetUpdateId)
 
+	// The keeper derives every consumer id from the ConsumerId sequence,
+	// which ExportGenesis enumerates from 0, so the imported ids must be
+	// exactly 0..n-1: a gap would export a phantom consumer with no phase,
+	// chain id, or owner, and the export would never validate again.
+	// GenesisState.Validate rejects this for the CLI; halting InitChain is
+	// the floor for a hand-edited genesis that skipped it.
+	seenConsumerIds := make(map[uint64]struct{}, len(genState.ConsumerStates))
+	for _, cs := range genState.ConsumerStates {
+		if _, dup := seenConsumerIds[cs.ConsumerId]; dup || cs.ConsumerId >= uint64(len(genState.ConsumerStates)) {
+			panic(fmt.Errorf("init: consumer ids must be distinct and contiguous from 0: got consumer id %d among %d consumer states", cs.ConsumerId, len(genState.ConsumerStates)))
+		}
+		seenConsumerIds[cs.ConsumerId] = struct{}{}
+	}
+
 	// First pass: write all per-consumer keeper collections under the
 	// provided consumer id from each ConsumerState.
-	maxConsumerId := uint64(0)
 	for i := range genState.ConsumerStates {
 		cs := &genState.ConsumerStates[i]
 		consumerId := cs.ConsumerId
-
-		// Track the highest imported consumer id so we can advance the keeper's
-		// ConsumerId sequence past it below; future MsgCreateConsumer calls
-		// then won't collide with the imported records.
-		if consumerId > maxConsumerId {
-			maxConsumerId = consumerId
-		}
 
 		// A deleted consumer carries no chain id (see DeleteConsumerChain):
 		// writing one back would re-reserve a chain id that the deletion
@@ -96,6 +102,24 @@ func (k Keeper) InitGenesis(ctx sdk.Context, genState *types.GenesisState) []abc
 				panic(fmt.Errorf("init: set paused-at time for %d: %w", consumerId, err))
 			}
 		}
+		if cs.RemovedByGovernance {
+			k.MarkConsumerRemovedByGovernance(ctx, consumerId)
+		}
+		for _, previous := range cs.PreviousChainIds {
+			if err := k.ConsumerPreviousChainIds.Set(ctx, collections.Join(consumerId, previous.ChainId), previous.Boundary); err != nil {
+				panic(fmt.Errorf("init: set previous chain id for %d: %w", consumerId, err))
+			}
+		}
+		if cs.ForkKnownAt != nil {
+			if err := k.SetConsumerForkKnownAt(ctx, consumerId, *cs.ForkKnownAt); err != nil {
+				panic(fmt.Errorf("init: set fork-known-at time for %d: %w", consumerId, err))
+			}
+		}
+		if cs.ClientRecoveredSinceFork {
+			if err := k.SetConsumerClientRecoveredSinceFork(ctx, consumerId); err != nil {
+				panic(fmt.Errorf("init: set the client-recovered mark for %d: %w", consumerId, err))
+			}
+		}
 		// Restore the liveness clock (see ExportGenesis): only when present, so
 		// a consumer that never launched keeps the absent-defaults.
 		if cs.LastAckTime != nil {
@@ -117,6 +141,14 @@ func (k Keeper) InitGenesis(ctx sdk.Context, genState *types.GenesisState) []abc
 		}
 		if len(cs.PendingValsetChanges) > 0 {
 			k.AppendPendingVSCPackets(ctx, consumerId, cs.PendingValsetChanges...)
+		}
+		// Restore the consumer's validator set as last sent, so evidence is
+		// judged against it from the first block (see ExportGenesis). An
+		// empty set still forces a snapshot at the next epoch (QueueVSCPackets).
+		if len(cs.ValidatorSet) > 0 {
+			if err := k.SetConsumerValSet(ctx, consumerId, cs.ValidatorSet); err != nil {
+				panic(fmt.Errorf("init: set validator set for %d: %w", consumerId, err))
+			}
 		}
 	}
 
@@ -158,11 +190,11 @@ func (k Keeper) InitGenesis(ctx sdk.Context, genState *types.GenesisState) []abc
 		}
 	}
 
-	// Advance the ConsumerId sequence past the highest imported id so
+	// Set the ConsumerId sequence past the imported ids, 0..n-1, so
 	// MsgCreateConsumer's next FetchAndIncrementConsumerId does not collide.
-	if len(genState.ConsumerStates) > 0 {
-		if err := k.ConsumerId.Set(ctx, maxConsumerId+1); err != nil {
-			panic(fmt.Errorf("init: advance consumer id sequence to %d: %w", maxConsumerId+1, err))
+	if n := uint64(len(genState.ConsumerStates)); n > 0 {
+		if err := k.ConsumerId.Set(ctx, n); err != nil {
+			panic(fmt.Errorf("init: advance consumer id sequence to %d: %w", n, err))
 		}
 	}
 
@@ -224,9 +256,12 @@ func (k Keeper) InitGenesis(ctx sdk.Context, genState *types.GenesisState) []abc
 		}
 	}
 
-	// Rebuild reverse-lookup from non-DELETED consumers (read phase collection)
-	// and, in the same pass, make sure no fee pool address holds a balance
-	// without a matching share record. Bank's InitGenesis runs before ours
+	// Rebuild the fee-pool reverse lookup for every consumer, DELETED ones
+	// included so the send restriction keeps refusing sends to their pools
+	// (see FeePoolSendRestriction), and, in the same pass, make sure no live
+	// consumer's fee pool holds a balance without a matching share record. A
+	// deleted consumer's pool is left alone: nothing may hold shares in it.
+	// Bank's InitGenesis runs before ours
 	// (see app.go OrderInitGenesis), so any pool balance present here was put
 	// there by the genesis file itself -- either hand-written, or exported from
 	// a chain where a community-pool spend addressed a pool directly. Rather
@@ -247,12 +282,12 @@ func (k Keeper) InitGenesis(ctx sdk.Context, genState *types.GenesisState) []abc
 		if err != nil {
 			panic(err)
 		}
-		if types.ConsumerPhase(phaseRaw) == types.CONSUMER_PHASE_DELETED {
-			continue
-		}
 		poolAddr := k.GetConsumerFeePoolAddress(consumerId)
 		if err := k.FeePoolAddressToConsumerId.Set(ctx, poolAddr, consumerId); err != nil {
 			panic(err)
+		}
+		if types.ConsumerPhase(phaseRaw) == types.CONSUMER_PHASE_DELETED {
+			continue
 		}
 		denomsWithShares := totals[consumerId]
 		for _, coin := range k.bankKeeper.GetAllBalances(ctx, poolAddr) {
@@ -269,7 +304,7 @@ func (k Keeper) InitGenesis(ctx sdk.Context, genState *types.GenesisState) []abc
 	// genesis JSON whose downtime object omits slash_fraction deserializes to
 	// a nil LegacyDec, which the store round-trip would turn into an explicit
 	// zero, silently capping every downtime slash at zero.
-	if err := genState.Params.Validate(); err != nil {
+	if err := k.ValidateParams(genState.Params); err != nil {
 		panic(fmt.Errorf("invalid parameters in genesis: %w", err))
 	}
 	k.SetParams(ctx, genState.Params)
@@ -482,6 +517,17 @@ func (k Keeper) ExportGenesis(ctx sdk.Context) *types.GenesisState {
 			panic(fmt.Errorf("export: failed to read init params for consumer %d: %w", consumerId, err))
 		}
 
+		// The validator set as last sent to the consumer. Without it a
+		// restarted provider has an empty set until the next epoch boundary
+		// rebuilds it, and HandleConsumerDowntime refuses every accusation
+		// meanwhile as naming a validator not in the set, which the consumer
+		// then drops for good.
+		valSet, err := k.GetConsumerValSet(ctx, consumerId)
+		if err != nil {
+			panic(fmt.Errorf("export: failed to read validator set for consumer %d: %w", consumerId, err))
+		}
+		cs.ValidatorSet = valSet
+
 		if clientId, ok := k.GetConsumerClientId(ctx, consumerId); ok {
 			cs.ClientId = clientId
 		}
@@ -506,6 +552,22 @@ func (k Keeper) ExportGenesis(ctx sdk.Context) *types.GenesisState {
 			cs.PausedAt = &pausedAt
 		} else if !errors.Is(err, collections.ErrNotFound) {
 			panic(fmt.Errorf("export: failed to read paused-at time for consumer %d: %w", consumerId, err))
+		}
+		cs.RemovedByGovernance = k.IsConsumerRemovedByGovernance(ctx, consumerId)
+		previous, err := k.GetConsumerPreviousChainIds(ctx, consumerId)
+		if err != nil {
+			panic(fmt.Errorf("export: failed to read previous chain ids for consumer %d: %w", consumerId, err))
+		}
+		cs.PreviousChainIds = previous
+		if forkKnownAt, err := k.GetConsumerForkKnownAt(ctx, consumerId); err == nil {
+			cs.ForkKnownAt = &forkKnownAt
+		} else if !errors.Is(err, collections.ErrNotFound) {
+			panic(fmt.Errorf("export: failed to read fork-known-at time for consumer %d: %w", consumerId, err))
+		}
+		if recovered, err := k.IsConsumerClientRecoveredSinceFork(ctx, consumerId); err == nil {
+			cs.ClientRecoveredSinceFork = recovered
+		} else {
+			panic(fmt.Errorf("export: failed to read the client-recovered mark for consumer %d: %w", consumerId, err))
 		}
 
 		// Liveness clock: export the last-ack time only when actually recorded
@@ -560,7 +622,7 @@ func (k Keeper) ExportGenesis(ctx sdk.Context) *types.GenesisState {
 	feePoolShares, recomputedTotals := k.exportFeePoolShares(ctx)
 
 	// Sanity check: compare stored ConsumerFeePoolTotalShares against the
-	// totals we just recomputed. Divergence is logged but not blocking —
+	// totals we just recomputed. Divergence is logged but not blocking:
 	// export should never fail on a sanity check.
 	k.checkFeePoolTotalsConsistency(ctx, recomputedTotals)
 

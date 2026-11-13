@@ -48,8 +48,7 @@ const removalVoteDeferralMargin = 30 * time.Second
 func (s *baseTestSuite) createEquivocatingValidator(key, selfBondAmount string) (valoperAddr string, priv cmted25519.PrivKey) { //nolint:unparam // every scenario bonds its equivocator with the same stake; the helper stays generic
 	containerID := s.providerValRes[0].Container.ID
 	priv = cmted25519.GenPrivKey()
-	pubJSON := fmt.Sprintf(`{"@type":"/cosmos.crypto.ed25519.PubKey","key":%q}`,
-		base64.StdEncoding.EncodeToString(priv.PubKey().Bytes()))
+	pubJSON := ed25519PubKeyJSON(priv.PubKey().Bytes())
 
 	s.dockerExecMust(containerID, []string{
 		providerBinary, "keys", "add", key,
@@ -104,17 +103,12 @@ func (s *baseTestSuite) createEquivocatingValidator(key, selfBondAmount string) 
 	return valoperAddr, priv
 }
 
-// fabricateDoubleVote signs two conflicting precommits at the same height and
-// round with the validator's real consumer key and writes the evidence and a
-// minimal but well-formed infraction header into the provider container,
-// returning the in-container file paths. The header carries a validator set
-// with the signing key and a commit over its own hash so that it passes the
-// message's ValidateBasic; the handler matches its chain id, reads the
-// validator set for the pubkey, and verifies the votes' signatures, not the
-// commit's.
-func (s *baseTestSuite) fabricateDoubleVote(priv cmted25519.PrivKey, chainID string, height int64, tag string) (evidencePath, headerPath string) {
+// signConflictingPrecommits signs two precommits for different blocks at the
+// same height and round of chainID with priv, the pair a double-signing
+// validator holding the key produces. They come back ordered by block id,
+// the order DuplicateVoteEvidence requires.
+func (s *baseTestSuite) signConflictingPrecommits(priv cmted25519.PrivKey, chainID string, height int64, validatorIndex int32, at time.Time) (voteA, voteB *tmproto.Vote) {
 	valAddr := priv.PubKey().Address()
-	now := time.Now().UTC()
 
 	makeVote := func(hashByte byte) *tmproto.Vote {
 		blockHash := make([]byte, 32)
@@ -131,9 +125,9 @@ func (s *baseTestSuite) fabricateDoubleVote(priv cmted25519.PrivKey, chainID str
 				Hash:          blockHash,
 				PartSetHeader: tmproto.PartSetHeader{Total: 1, Hash: partHash},
 			},
-			Timestamp:        now,
+			Timestamp:        at,
 			ValidatorAddress: valAddr,
-			ValidatorIndex:   0,
+			ValidatorIndex:   validatorIndex,
 		}
 		sig, err := priv.Sign(tmtypes.VoteSignBytes(chainID, v))
 		s.Require().NoError(err, "failed to sign fabricated vote")
@@ -141,9 +135,24 @@ func (s *baseTestSuite) fabricateDoubleVote(priv cmted25519.PrivKey, chainID str
 		return v
 	}
 
+	return makeVote(0xAA), makeVote(0xBB)
+}
+
+// fabricateDoubleVote signs two conflicting precommits at the same height and
+// round with the validator's real consumer key and writes the evidence and a
+// minimal but well-formed infraction header into the provider container,
+// returning the in-container file paths. The header carries a validator set
+// with the signing key and a commit over its own hash so that it passes the
+// message's ValidateBasic; the handler matches its chain id, reads the
+// validator set for the pubkey, and verifies the votes' signatures, not the
+// commit's.
+func (s *baseTestSuite) fabricateDoubleVote(priv cmted25519.PrivKey, chainID string, height int64, tag string) (evidencePath, headerPath string) {
+	now := time.Now().UTC()
+
+	voteA, voteB := s.signConflictingPrecommits(priv, chainID, height, 0, now)
 	evidence := &tmproto.DuplicateVoteEvidence{
-		VoteA:            makeVote(0xAA),
-		VoteB:            makeVote(0xBB),
+		VoteA:            voteA,
+		VoteB:            voteB,
 		TotalVotingPower: 5,
 		ValidatorPower:   5,
 		Timestamp:        now,
@@ -235,11 +244,18 @@ type pendingEquivocationJSON struct {
 // punishments; the error lets polling callers retry and asserting callers
 // fail rather than read a broken query as an empty queue.
 func (s *baseTestSuite) queryPendingEquivocations(consumerID string) ([]pendingEquivocationJSON, error) {
-	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
+	return s.queryPendingEquivocationsWith(consumerID)
+}
+
+// queryPendingEquivocationsWith is queryPendingEquivocations with extra query
+// flags, such as a past height.
+func (s *baseTestSuite) queryPendingEquivocationsWith(consumerID string, flags ...string) ([]pendingEquivocationJSON, error) {
+	args := append([]string{
 		providerBinary, "query", "vaasprovider", "pending-equivocation-punishments", consumerID,
 		"--home", providerHomePath,
 		"--output", "json",
-	})
+	}, flags...)
+	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, args)
 	if err != nil {
 		return nil, fmt.Errorf("query pending-equivocation-punishments: %w (stderr=%s)", err, stderr.String())
 	}
@@ -256,7 +272,7 @@ func (s *baseTestSuite) queryPendingEquivocations(consumerID string) ([]pendingE
 }
 
 // mustPendingEquivocations is queryPendingEquivocations for assertions.
-func (s *baseTestSuite) mustPendingEquivocations(consumerID string) []pendingEquivocationJSON { //nolint:unparam // the suite drives one consumer; the helper stays generic
+func (s *baseTestSuite) mustPendingEquivocations(consumerID string) []pendingEquivocationJSON { //nolint:unparam // the suites drive one consumer; the helper stays generic
 	pending, err := s.queryPendingEquivocations(consumerID)
 	s.Require().NoError(err)
 	return pending
@@ -264,7 +280,7 @@ func (s *baseTestSuite) mustPendingEquivocations(consumerID string) []pendingEqu
 
 // pendingEquivocationsEmpty reports whether the consumer's queue reads back
 // empty; a failing query does not count as empty.
-func (s *baseTestSuite) pendingEquivocationsEmpty(consumerID string) bool {
+func (s *baseTestSuite) pendingEquivocationsEmpty(consumerID string) bool { //nolint:unparam // the suites drive one consumer; the helper stays generic
 	pending, err := s.queryPendingEquivocations(consumerID)
 	return err == nil && len(pending) == 0
 }
@@ -319,11 +335,22 @@ type unbondingEntryJSON struct {
 // unbondingEntries lists the delegator's unbonding entries toward the
 // validator (balance and on-hold refcount), or nothing while the query fails.
 func (s *baseTestSuite) unbondingEntries(delegator, valoper string) []unbondingEntryJSON {
-	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
+	return s.unbondingEntriesWith(delegator, valoper)
+}
+
+// unbondingEntriesAt is unbondingEntries as of a past provider height.
+func (s *baseTestSuite) unbondingEntriesAt(delegator, valoper string, height int64) []unbondingEntryJSON {
+	return s.unbondingEntriesWith(delegator, valoper, "--height", strconv.FormatInt(height, 10))
+}
+
+// unbondingEntriesWith is unbondingEntries with extra query flags.
+func (s *baseTestSuite) unbondingEntriesWith(delegator, valoper string, flags ...string) []unbondingEntryJSON {
+	args := append([]string{
 		providerBinary, "query", "staking", "unbonding-delegation", delegator, valoper,
 		"--home", providerHomePath,
 		"--output", "json",
-	})
+	}, flags...)
+	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, args)
 	if err != nil || stdout.Len() == 0 {
 		return nil
 	}
@@ -353,7 +380,16 @@ func (s *baseTestSuite) singleUnbondingEntryHas(delegator, valoper, refCount str
 // mustUnbondingBalance returns the balance of the delegator's single unbonding
 // entry toward the validator.
 func (s *baseTestSuite) mustUnbondingBalance(delegator, valoper string) int64 {
-	entries := s.unbondingEntries(delegator, valoper)
+	return s.mustSingleUnbondingBalance(s.unbondingEntries(delegator, valoper))
+}
+
+// mustUnbondingBalanceAt is mustUnbondingBalance as of a past provider height.
+func (s *baseTestSuite) mustUnbondingBalanceAt(delegator, valoper string, height int64) int64 {
+	return s.mustSingleUnbondingBalance(s.unbondingEntriesAt(delegator, valoper, height))
+}
+
+// mustSingleUnbondingBalance returns the balance of the one entry listed.
+func (s *baseTestSuite) mustSingleUnbondingBalance(entries []unbondingEntryJSON) int64 {
 	s.Require().Len(entries, 1, "expected exactly one unbonding entry")
 	v, err := strconv.ParseInt(entries[0].Balance, 10, 64)
 	s.Require().NoErrorf(err, "unparsable unbonding balance %q", entries[0].Balance)
@@ -361,8 +397,9 @@ func (s *baseTestSuite) mustUnbondingBalance(delegator, valoper string) int64 {
 }
 
 // unbondFrom starts an undelegation of amount from the validator, signed by
-// the keyring key, and waits for the tx to commit.
-func (s *baseTestSuite) unbondFrom(key, valoper, amount string) {
+// the keyring key, waits for the tx to commit and returns the height it
+// landed at.
+func (s *baseTestSuite) unbondFrom(key, valoper, amount string) int64 {
 	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
 		providerBinary, "tx", "staking", "unbond", valoper, amount,
 		"--from", key,
@@ -374,7 +411,7 @@ func (s *baseTestSuite) unbondFrom(key, valoper, amount string) {
 		"-y", "-o", "json",
 	})
 	s.Require().NoErrorf(err, "failed to unbond from %s: stderr=%s", key, stderr.String())
-	s.requireTxCommitted(stdout.Bytes())
+	return s.requireTxCommitted(stdout.Bytes())
 }
 
 // mustUnjail broadcasts MsgUnjail from the keyring key until it is accepted,
@@ -423,7 +460,7 @@ func (s *baseTestSuite) removalProposalJSON(consumerID, title string) string {
 
 // setConsumerRefusal records or withdraws val's refusal of the consumer and
 // waits for the tx to commit.
-func (s *IntegrationTestSuite) setConsumerRefusal(consumerID string, refused bool) {
+func (s *baseTestSuite) setConsumerRefusal(consumerID string, refused bool) { //nolint:unparam // the suites drive one consumer; the helper stays generic
 	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
 		providerBinary, "tx", "vaasprovider", "set-consumer-refusal", consumerID, strconv.FormatBool(refused),
 		"--from", "val",
@@ -438,7 +475,7 @@ func (s *IntegrationTestSuite) setConsumerRefusal(consumerID string, refused boo
 }
 
 // resumeProposalJSON builds a MsgResumeConsumer gov proposal body.
-func (s *IntegrationTestSuite) resumeProposalJSON(consumerID, title string) string {
+func (s *baseTestSuite) resumeProposalJSON(consumerID, title string) string { //nolint:unparam // the suites drive one consumer; the helper stays generic
 	return fmt.Sprintf(`{
   "messages": [{
     "@type": "/vaas.provider.v1.MsgResumeConsumer",
@@ -482,7 +519,8 @@ func (s *IntegrationTestSuite) testConsumerRefusalPauseAndResume() {
 		s.T().Log("withdrawing the refusal: nothing resumes on its own...")
 		s.setConsumerRefusal(consumerID, false)
 		s.Require().Never(func() bool {
-			return s.queryProviderConsumerPhase(consumerID) != "CONSUMER_PHASE_PAUSED"
+			phase := s.queryProviderConsumerPhase(consumerID)
+			return phase != "" && phase != "CONSUMER_PHASE_PAUSED"
 		}, 16*time.Second, 4*time.Second, "withdrawing a refusal must not resume the consumer by itself")
 
 		s.T().Log("resuming the consumer via governance now that the coalition is gone...")
@@ -495,7 +533,8 @@ func (s *IntegrationTestSuite) testConsumerRefusalPauseAndResume() {
 		// Still launched over the next blocks: the withdrawn signal stays
 		// withdrawn, so nothing re-pauses the consumer.
 		s.Require().Never(func() bool {
-			return s.queryProviderConsumerPhase(consumerID) != "CONSUMER_PHASE_LAUNCHED"
+			phase := s.queryProviderConsumerPhase(consumerID)
+			return phase != "" && phase != "CONSUMER_PHASE_LAUNCHED"
 		}, 16*time.Second, 4*time.Second, "the resumed consumer must stay launched")
 	})
 }
@@ -518,7 +557,7 @@ func (s *IntegrationTestSuite) testDowntimeDeferralBehindRejectedRemoval() {
 				if err != nil {
 					continue
 				}
-				// A fresh entry matures downtime_challenge_window (30s) after
+				// A fresh entry matures downtime_challenge_window (120s) after
 				// acceptance; leave room to submit the vote 20s before that.
 				if !p.MaturesAtExtended && time.Until(maturity) > 22*time.Second {
 					target = p

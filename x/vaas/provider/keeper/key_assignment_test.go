@@ -3,6 +3,7 @@ package keeper_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/rand"
 	"sort"
 	"testing"
@@ -13,6 +14,8 @@ import (
 
 	abci "github.com/cometbft/cometbft/abci/types"
 	tmprotocrypto "github.com/cometbft/cometbft/proto/tendermint/crypto"
+
+	storetypes "cosmossdk.io/store/types"
 
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -55,7 +58,7 @@ func TestValidatorConsumerPubKeyCRUD(t *testing.T) {
 // every reverse mapping that names the old address, not just the first of
 // either.
 //
-// Both counts are load-bearing. A validator validates every consumer, so a
+// Both counts matter. A validator validates every consumer, so a
 // migration that stopped at the first would leave the rest resolving a rotated
 // validator's assigned key under an address it no longer holds. And a validator
 // has more than one reverse mapping on a consumer whenever it has re-assigned
@@ -140,13 +143,12 @@ func TestMigrateStateOnConsPubKeyRotationCoversEveryConsumerAndMapping(t *testin
 
 // TestBeforeConsensusPubKeyRotationRefusesAnAssignedConsumerKey pins the
 // enforcement point: x/staking asks this hook before it records a rotation,
-// and the provider refuses one onto a consensus key another validator holds
-// as an assigned consumer key on any consumer that is not deleted, paused and
-// stopped ones included. A key no consumer holds passes; so does the key of a
-// deleted consumer, whose assignments are gone with it, and so does a key the
-// rotating validator holds itself, since AssignConsumerKey lets one validator
-// run matching keys and only two different validators can collide on a
-// consumer.
+// and the provider refuses one onto a consensus key any validator holds as an
+// assigned consumer key on any consumer that is not deleted, paused and
+// stopped ones included. The rotating validator's own assigned key is refused
+// too, current or awaiting pruning, until the key is pruned. A key no
+// consumer holds passes; so does the key of a deleted consumer, whose
+// assignments are gone with it.
 func TestBeforeConsensusPubKeyRotationRefusesAnAssignedConsumerKey(t *testing.T) {
 	keeper, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
@@ -170,8 +172,21 @@ func TestBeforeConsensusPubKeyRotationRefusesAnAssignedConsumerKey(t *testing.T)
 	fresh := cryptotestutil.NewCryptoIdentityFromIntSeed(3)
 	require.NoError(t, rotateOnto(rotating, fresh))
 
-	require.NoError(t, rotateOnto(holder, takenKey),
-		"a validator may rotate its provider key onto a consumer key it holds itself")
+	require.ErrorIs(t, rotateOnto(holder, takenKey), types.ErrConsumerKeyInUse,
+		"a validator may not rotate its provider key onto a consumer key it assigned itself")
+
+	// The holder replaced takenKey with currentKey: takenKey awaits pruning,
+	// still resolving to the holder, and stays refused until it is pruned.
+	currentKey := cryptotestutil.NewCryptoIdentityFromIntSeed(4)
+	keeper.SetValidatorConsumerPubKey(ctx, consumerID, holder.ProviderConsAddress(), currentKey.TMProtoCryptoPublicKey())
+	keeper.SetValidatorByConsumerAddr(ctx, consumerID, currentKey.ConsumerConsAddress(), holder.ProviderConsAddress())
+	require.ErrorIs(t, rotateOnto(holder, currentKey), types.ErrConsumerKeyInUse,
+		"the holder's current assignment is refused")
+	require.ErrorIs(t, rotateOnto(holder, takenKey), types.ErrConsumerKeyInUse,
+		"a key awaiting pruning is refused to its own validator")
+	keeper.DeleteValidatorByConsumerAddr(ctx, consumerID, takenKey.ConsumerConsAddress())
+	require.NoError(t, rotateOnto(holder, takenKey), "a pruned key is free again")
+	keeper.SetValidatorByConsumerAddr(ctx, consumerID, takenKey.ConsumerConsAddress(), holder.ProviderConsAddress())
 
 	keeper.SetConsumerPhase(ctx, consumerID, types.CONSUMER_PHASE_DELETED)
 	require.NoError(t, rotateOnto(rotating, takenKey),
@@ -1404,4 +1419,92 @@ func TestAssignConsumerKeyUnrelatedSameBlockRotationDoesNotBlock(t *testing.T) {
 	got, found := k.GetValidatorByConsumerAddr(ctx, consumerId, consumerKey.ConsumerConsAddress())
 	require.True(t, found)
 	require.Equal(t, assigner.ProviderConsAddress(), got)
+}
+
+// TestAssignConsumerKeyRefusesAKeyAssignedOnAnotherConsumer: one assigned key
+// serves one consumer. A validator that holds a key on one consumer cannot
+// assign the same key on a second (its node for the one could sign for the
+// other), a different key is fine, and reverting to its own provider key is
+// allowed on every consumer since a provider key is not an assigned one.
+func TestAssignConsumerKeyRefusesAKeyAssignedOnAnotherConsumer(t *testing.T) {
+	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+
+	provider := cryptotestutil.NewCryptoIdentityFromIntSeed(5100)
+	shared := cryptotestutil.NewCryptoIdentityFromIntSeed(5101)
+	other := cryptotestutil.NewCryptoIdentityFromIntSeed(5102)
+	first := k.FetchAndIncrementConsumerId(ctx)
+	second := k.FetchAndIncrementConsumerId(ctx)
+	k.SetConsumerPhase(ctx, first, types.CONSUMER_PHASE_LAUNCHED)
+	k.SetConsumerPhase(ctx, second, types.CONSUMER_PHASE_LAUNCHED)
+
+	mocks.MockStakingKeeper.EXPECT().GetValidatorByConsAddr(gomock.Any(), shared.SDKValConsAddress()).
+		Return(stakingtypes.Validator{}, stakingtypes.ErrNoValidatorFound).AnyTimes()
+	mocks.MockStakingKeeper.EXPECT().GetValidatorByConsAddr(gomock.Any(), other.SDKValConsAddress()).
+		Return(stakingtypes.Validator{}, stakingtypes.ErrNoValidatorFound).AnyTimes()
+	mocks.MockStakingKeeper.EXPECT().GetValidatorByConsAddr(gomock.Any(), provider.SDKValConsAddress()).
+		Return(provider.SDKStakingValidator(), nil).AnyTimes()
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(time.Hour, nil).AnyTimes()
+
+	require.NoError(t, k.AssignConsumerKey(ctx, first, provider.SDKStakingValidator(), shared.TMProtoCryptoPublicKey()))
+
+	err := k.AssignConsumerKey(ctx, second, provider.SDKStakingValidator(), shared.TMProtoCryptoPublicKey())
+	require.ErrorIs(t, err, types.ErrConsumerKeyInUse, "the key is already assigned on the first consumer")
+	_, found := k.GetValidatorByConsumerAddr(ctx, second, shared.ConsumerConsAddress())
+	require.False(t, found)
+
+	require.NoError(t, k.AssignConsumerKey(ctx, second, provider.SDKStakingValidator(), other.TMProtoCryptoPublicKey()),
+		"a different key on the second consumer is fine")
+
+	require.NoError(t, k.AssignConsumerKey(ctx, second, provider.SDKStakingValidator(), provider.TMProtoCryptoPublicKey()),
+		"reverting to the provider key is allowed on every consumer")
+	require.NoError(t, k.AssignConsumerKey(ctx, first, provider.SDKStakingValidator(), provider.TMProtoCryptoPublicKey()),
+		"and on the first consumer too, although the second now maps the provider key")
+}
+
+// TestConsumeConsumerAddrsToPruneStopsAtTheFirstFutureEntry: the prune queue
+// is keyed by prune time, so consuming it at ts reads the due entries and the
+// first future one and stops there. Only the due entries are consumed, and
+// the cost of the walk does not grow with the number of entries still in the
+// future.
+func TestConsumeConsumerAddrsToPruneStopsAtTheFirstFutureEntry(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// seed queues three due entries and the given number of future ones.
+	seed := func(t *testing.T, future int) (providerkeeper.Keeper, sdk.Context) {
+		t.Helper()
+		k, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+		t.Cleanup(ctrl.Finish)
+		for i := 1; i <= 3; i++ {
+			k.AppendConsumerAddrsToPrune(ctx, CONSUMER_ID, now.Add(-time.Duration(i)*time.Hour),
+				types.NewConsumerConsAddress([]byte(fmt.Sprintf("due-%d", i))))
+		}
+		for i := 1; i <= future; i++ {
+			k.AppendConsumerAddrsToPrune(ctx, CONSUMER_ID, now.Add(time.Duration(i)*time.Hour),
+				types.NewConsumerConsAddress([]byte(fmt.Sprintf("future-%d", i))))
+		}
+		return k, ctx
+	}
+	consume := func(k providerkeeper.Keeper, ctx sdk.Context) (types.AddressList, storetypes.Gas) {
+		ctx = ctx.WithGasMeter(storetypes.NewInfiniteGasMeter())
+		consumed := k.ConsumeConsumerAddrsToPrune(ctx, CONSUMER_ID, now)
+		return consumed, ctx.GasMeter().GasConsumed()
+	}
+
+	dense, denseCtx := seed(t, 200)
+	consumed, denseGas := consume(dense, denseCtx)
+	require.Len(t, consumed.Addresses, 3)
+	for i := 1; i <= 3; i++ {
+		require.Contains(t, consumed.Addresses, []byte(fmt.Sprintf("due-%d", i)))
+	}
+	remaining := dense.GetAllConsumerAddrsToPrune(denseCtx, CONSUMER_ID)
+	require.Len(t, remaining, 200)
+	for _, entry := range remaining {
+		require.True(t, entry.PruneTs.After(now), "a future entry was consumed: %s", entry.PruneTs)
+	}
+
+	sparse, sparseCtx := seed(t, 1)
+	_, sparseGas := consume(sparse, sparseCtx)
+	require.Positive(t, sparseGas)
+	require.Equal(t, sparseGas, denseGas, "the walk read past the first future entry")
 }

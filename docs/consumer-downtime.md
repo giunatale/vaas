@@ -38,8 +38,10 @@ exists.
 The consumer's VAAS module tracks missed blocks itself, reading each block's `LastCommit`
 vote flags in `BeginBlock`. Detection does not use `x/slashing`'s sliding window: consumers
 cannot jail (the validator set is provider-owned), and a sliding window without jail
-re-triggers on every block once below threshold. The consumer's `x/slashing` downtime calls
-into the VAAS keeper are log-only.
+re-triggers on every block once below threshold. The reference consumer wires no
+`x/slashing` at all (its message types are not registered, so a transaction carrying one
+fails to decode), so there are no signing infos, no `liveness` or `slash` events and no
+slashing parameters on the consumer: operators read downtime from the VAAS events.
 
 Windows are **tumbling**: heights `[k*W, (k+1)*W)` where `W = SignedBlocksWindow`. Each
 validator gets one bit per height (`1` = missed, absent from the commit). When the window
@@ -57,7 +59,10 @@ threshold more lenient for partial windows.
 The evidence packet carries the bitmap itself (`bit i` = height `window_start + i`), the
 window's last height as `window_end_height`, and echoes the `SignedBlocksWindow` /
 `MinSignedPerWindow` values the bitmap was computed under. The bitmap is what makes the
-evidence challengeable: each set bit is an individually falsifiable claim.
+evidence challengeable: each set bit is an individually falsifiable claim. The accused
+validator's consumer consensus address travels as raw bytes, not as a bech32 string: the
+two chains normally run under different address prefixes, and a string would carry the
+consumer's prefix into a provider that decodes under its own.
 
 ## 2. Downtime parameters are provider-owned
 
@@ -103,9 +108,14 @@ acknowledgement at the first failure:
    true window-end time, and the anchor can therefore never place the window end later than
    it really was. Against that anchor: the window must end after the launch grace period
    (`SpawnTime + DowntimeGracePeriod`), must be no older than `DowntimeEvidenceMaxAge`
-   at receipt -- old windows are rejected because their challenge data availability decays --
-   and must leave the whole `DowntimeChallengeWindow` inside the consumer client's trusting
-   period, so the accused can still verify a challenge header at the end of it.
+   at receipt -- old windows are rejected because their challenge data availability decays.
+   The window *start* is anchored the same way, and that anchor must leave the whole
+   `DowntimeChallengeWindow` inside the consumer client's trusting period: a challenge of a
+   claimed height verifies the header at that height plus one against a stored consensus
+   state below it, so the state anchoring the window start, up to a whole window of
+   consumer blocks older than the window-end anchor, is the oldest one any height of the
+   window needs, and the accused can still challenge every height of the window at the end
+   of it.
    Anchoring to the upper state instead would overstate the window-end time by however far
    the client skipped past it, understating the evidence's age by the same amount and
    admitting evidence whose challenge data is already gone; anchoring to the lower state
@@ -151,8 +161,9 @@ must disprove and by when.
 
 A rejected packet emits nothing on the provider -- the rejection travels back as an IBC
 error acknowledgement, and the *consumer* surfaces it as
-`vaas_consumer_evidence_rejected` (with the raw ack in the `error` attribute) and drops
-the packet rather than retrying it. See [events-reference.md](events-reference.md).
+`vaas_consumer_evidence_rejected` (naming the validator and the window end; the ack bytes
+are not carried) and drops the packet rather than retrying it. See
+[events-reference.md](events-reference.md).
 
 ## 4. Pricing and execution: P*M/C behind a challenge window
 
@@ -198,6 +209,12 @@ at liveness-fault scale, far below the double-sign fraction -- but each pending 
 compound with no aggregate bound. A downtime slash **never jails**. Entries whose validator has
 meanwhile unbonded, been tombstoned, or has no slashable stake are dropped with an event rather
 than executed; a zero-token slash is likewise dropped as vacuous.
+
+The slash is applied with infraction height 0, as the equivocation slash is: a consumer height
+cannot be mapped to a provider height, so `x/staking` slashes every unmatured undelegation and
+redelegation from the validator, whenever it began, as well as its bonded stake. The slashable
+power the fraction applies to counts that in-flight stake in (`slashableStake`), so a delegator
+who left up to an unbonding period before the accused window is reached by the same fraction.
 
 ## 5. Fee exclusion and the pool as escrow
 
@@ -297,10 +314,22 @@ proves the chain's consensus is compromised without proving who is at fault, so 
 contains the chain and punishes nobody, and the consumer's IBC client is frozen so that no
 packet proven against the fork lands any more; `MsgSubmitConsumerMisbehaviour` does both in one
 transaction (see `HandleConsumerMisbehaviour`), and a client frozen through ibc-go's
-`MsgUpdateClient` is caught by the provider's BeginBlock, which pauses the consumer. A refusal
-coalition reaching `RefusalPauseThreshold` pauses the consumer the same way (see
-[consumer-refusal.md](consumer-refusal.md)). A challenge or light-client pause first repays
-the fees withheld from accused validators: their accusations are cancelled with it and could
+`MsgUpdateClient` is caught by the provider's BeginBlock, which pauses the consumer, or, when
+the consumer is already paused for a challenge or a refusal, moves that pause under the
+light-client reason (discarding the accusations as a light-client pause does, and recording
+the fork as known from that block for the resume's wait to count from, while the pause keeps
+the time it began), so governance does not resume it into the fork. The same BeginBlock
+follows a light-client pause through a client recovery: a client recovered during the pause
+and frozen again by a later fork has the fork recorded as known from the block it is next
+seen frozen at, the pause again keeping the time it began. A refusal coalition
+reaching `RefusalPauseThreshold` pauses the consumer the same way (see
+[consumer-refusal.md](consumer-refusal.md)). So does a declared client that tracks a chain id
+other than the consumer's, which an ibc-go client upgrade or recovery can leave behind: the
+provider's BeginBlock pauses the consumer, since a challenge needs a header signed over the
+consumer's chain id that the client verifies, and the client verifies only headers of the
+chain id it tracks (see
+[consumer-lifecycle.md](consumer-lifecycle.md#renaming-a-launched-consumer)). A challenge,
+light-client or mismatch pause first repays the fees withheld from accused validators: their accusations are cancelled with it and could
 not be challenged any more. A refusal pause proves nothing about the accusations and freezes
 them instead: pending slashes and withheld records keep their state with their clocks
 stopped, a resume restarts the clocks where the pause stopped them, and a challenge proven
@@ -308,13 +337,20 @@ meanwhile discards them as above. The `vaas_consumer_paused` event names the rea
 paused:
 
 - No VSC packets are queued or sent; no fees are distributed; downtime evidence from the
-  consumer is rejected.
+  consumer is rejected, and the consumer drops it: downtime inside a pause is deliberately
+  not punished, since the provider is not serving the consumer and the validators a
+  refusal pause protects are not to be accused for it. Double-voting evidence is still
+  accepted (see [equivocation-evidence.md](equivocation-evidence.md)).
 - The liveness sweep skips it (the pause is not ack-silence), and the consumer side needs no
   new mechanism: its VSC clock goes stale and the existing safe mode restricts it
   automatically.
 - An **auto-stop** is scheduled at `now + MaxPauseDuration`: a pause governance never
   resolves becomes `STOPPED` (then `DELETED`) like any other dead consumer. No consumer can
-  be paused forever.
+  be paused forever. One pause outlives the parameter: a light-client pause is not stopped
+  while its fork wait (below) runs, since the resume is refused until then and the stop
+  would have made the pause terminal; its auto-stop moves to the end of the wait, capped at
+  one provider unbonding period after the fork became known (a declared client's wait fits
+  within it).
 - The consumer keeps all of its state, key assignments included -- they are what the resume
   snapshot is rebuilt from. So a paused consumer stays visible to anything asking whether a
   consumer still holds state: notably the consensus-key collision guard that runs when a
@@ -327,9 +363,10 @@ paused:
   address for pruning rather than deleting it, since a paused consumer is exactly the one
   with downtime state in flight and both the challenge lookup and the re-submission defence
   resolve an accused address through that mapping.
-- **`MsgUpdateConsumer` is refused**, unlike key assignment. An update can rewrite the
-  infraction and initialization parameters the challenge was judged under, and the resume
-  path replays state built from them. Resume or remove first, then update.
+- **`MsgUpdateConsumer` stays open** for the metadata, the ownership and the client
+  declaration, as on a launched consumer; the initialization parameters are frozen, and only
+  the governance authority changes the chain id, to the one the declared client tracks (see
+  [consumer-lifecycle.md](consumer-lifecycle.md#renaming-a-launched-consumer)).
 
 Two governance exits:
 
@@ -343,25 +380,42 @@ Two governance exits:
   (45 days) exceeds the client trusting period, so a long pause with idle relayers can
   expire the client. An expired or frozen client fails the resume with instructions to
   bundle ibc-go's `MsgRecoverClient` (client substitution, already governance-gated) in the
-  same proposal. Client expiry during a pause is therefore a recoverable inconvenience, not
-  a death sentence -- which is why `MaxPauseDuration` is not bounded by the trusting period.
+  same proposal. The substitute must track the consumer's chain id, or the proposal also
+  carries the governance rename (`MsgUpdateConsumer` with the client's chain id), and its
+  trusting period must clear the downtime challenge horizon like the declaration's did: the
+  resume checks both and refuses a client that fails either, and the rename checks the
+  trusting period too. After a mismatch pause the
+  same check is the whole exit: the proposal renames the consumer to the client's chain id,
+  or recovers the client onto the consumer's, and resumes it. Client expiry during a pause
+  is therefore a recoverable inconvenience, not a death sentence -- which is why
+  `MaxPauseDuration` is not bounded by the trusting period.
   A resume after a light-client pause also waits out the fork's evidence: a recovery keeps
   the client's pre-fork consensus states, and the conflicting headers verify against them on
   either submission path until those states age out of the trusting period, so a consumer
   resumed earlier would be paused again by the same headers. The resume is refused until one
-  trusting period (plus the client's clock-drift allowance) has passed since the pause; with
-  a 21-day consumer unbonding period that is about 14 days, which AtomOne's voting period
-  alone already covers. A fork at a later height is new evidence and pauses it again.
+  trusting period (plus the client's clock-drift allowance) has passed since the fork became
+  known: the pause itself, the block a challenge or refusal pause was moved under the
+  light-client reason at, or the block the client was next seen frozen at after a recovery
+  during the pause. With a 21-day consumer unbonding period that is about 14 days, which
+  AtomOne's voting period alone already covers. A `MaxPauseDuration` within the wait does
+  not make the pause terminal: the auto-stop waits for the resume to become possible (see
+  above). A fork at a later height is new evidence and pauses it again.
 - **`MsgRemoveConsumer`** accepts a paused consumer and routes it into the ordinary
   `STOPPED -> DELETED` teardown.
 
 Stopping or deleting a consumer cancels its in-flight downtime state (pending slashes and
-epoch marks), as does a pause for a disproven or discredited source: once no epoch or
-challenge window remains to resolve them against, they are cancelled outright. A refusal
-pause freezes them instead. The accepted-window records and the pruned floor survive a
-pause or stop -- a disproven or cancelled window must not become re-submittable, while
-later disjoint windows remain submittable after a resume as usual. Full deletion erases
-them along with the escrow records.
+epoch marks), as does a pause for a disproven, discredited or undisprovable source: once no
+epoch or challenge window remains to resolve them against, they are cancelled outright. A
+refusal pause freezes them instead. A governance rename cancels them too, and repays the
+withheld fees: the client verifies a challenge header over the chain id it tracks after the
+rename, so no header signed over the old one could disprove an accusation from before the
+rename, and an accusation that cannot be disproved does not stand. In the block in which the declared
+client switches to another chain id, before the next BeginBlock pauses the consumer, no
+downtime evidence is accepted from it; after a rename, none is accepted whose window starts
+at or below the client's height at it. The accepted-window records and the pruned floor
+survive a pause or stop -- a disproven or cancelled window must not become re-submittable,
+while later disjoint windows remain submittable after a resume as usual. Full deletion
+erases them along with the escrow records.
 
 ## 8. Parameters and bounds
 
@@ -404,9 +458,10 @@ That check bounds the interval by the trusting period derived from the *default*
 unbonding period, i.e. it constrains the parameters in the abstract, and deliberately not by
 the clients that exist: a consumer adopted with a shorter trusting period would otherwise veto
 a provider-wide change. The client that actually verifies a challenge bounds evidence at
-acceptance instead: an accusation is rejected when its age plus `DowntimeChallengeWindow`
-reaches that client's trusting period (section 3), so every accusation the provider accepts
-stays challengeable for its whole window, whatever the parameters say.
+acceptance instead: an accusation is rejected when the age of its window-start anchor plus
+`DowntimeChallengeWindow` reaches that client's trusting period (section 3), so every
+accusation the provider accepts stays challengeable, at every height of its window, for its
+whole challenge window, whatever the parameters say.
 
 ## 9. Operator guidance
 
@@ -456,16 +511,17 @@ stays challengeable for its whole window, whatever the parameters say.
 - Re-submission of an already accepted window (even after its slash executed), overlapping
   windows, and evidence about windows too old to challenge.
 - VSC-shaped packets from a chain that is not the provider: inbound VAAS packets must carry
-  the provider application's source port, and the consumer accepts them only over a client
-  whose tracked chain id matches the provider chain id pinned at genesis (or at first
-  contact). See [consumer-liveness.md](consumer-liveness.md) for the delivery model.
+  the provider application's source port, and the consumer accepts them only over the
+  pinned provider client, whose tracked chain id `MsgSetProviderClient` checked, when it was
+  pinned, against the provider chain id seeded at genesis from the provider-authored client
+  state. See [consumer-liveness.md](consumer-liveness.md) for the delivery model.
 - An attacker chain reusing the provider's exact chain-id string. No forged light-client
   history is needed for this -- IBC attaches no meaning to chain-id uniqueness, so a chain
   that simply reports the provider's chain id passes the chain-id check while carrying a
   different validator set. What stops it is that the provider client is never inferred from
   traffic at all: a new consumer starts with no provider client pinned and rejects every VSC
-  packet until the owner seeded into the consumer params (or governance) pins the
-  relayer-created client explicitly with `MsgSetProviderClient`, exactly once. Were the pin
+  packet until the owner seeded into the consumer params (or the chain's authority) pins
+  the relayer-created client explicitly with `MsgSetProviderClient`, exactly once. Were the pin
   ever movable by an incoming packet, such a packet would redirect every downtime evidence
   packet to a chain that discards them, and a large `valset_update_id` in the same packet
   would strand the real provider below the dedup watermark for good. Recovering an expired

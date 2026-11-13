@@ -88,8 +88,8 @@ func TestInitGenesis(t *testing.T) {
 		{
 			"start a new chain",
 			func(ctx sdk.Context, mocks testkeeper.MockedKeepers) {
-				// No client is created at genesis; an unexpected CreateClient
-				// call fails the test through the mock controller.
+				// InitGenesis creates no client: the relayer creates it and
+				// the owner pins it via MsgSetProviderClient.
 			},
 			consumertypes.NewInitialGenesisState(
 				provClientState,
@@ -137,6 +137,47 @@ func TestInitGenesis(t *testing.T) {
 
 			tc.assertStates(ctx, consumerKeeper, tc.genesis)
 		})
+	}
+}
+
+// TestInitGenesisCollapsesRepeatedPubkeys: a genesis validator set naming
+// one pubkey twice collapses to its last entry, as the packet paths do,
+// instead of handing CometBFT two InitChain validators for one address.
+func TestInitGenesisCollapsesRepeatedPubkeys(t *testing.T) {
+	consumerKeeper, ctx, ctrl, mocks := testkeeper.GetConsumerKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+	expectProviderClientExists(mocks)
+
+	pkA, err := cryptocodec.ToCmtProtoPublicKey(ed25519.GenPrivKey().PubKey())
+	require.NoError(t, err)
+	pkB, err := cryptocodec.ToCmtProtoPublicKey(ed25519.GenPrivKey().PubKey())
+	require.NoError(t, err)
+	valset := []abci.ValidatorUpdate{
+		{PubKey: pkA, Power: 5},
+		{PubKey: pkA, Power: 9},
+		{PubKey: pkB, Power: 3},
+	}
+
+	updates := consumerKeeper.InitGenesis(ctx, consumertypes.NewRestartGenesisState(
+		genesisProviderClientID, valset, vaastypes.DefaultConsumerParams(),
+	))
+
+	require.Len(t, updates, 2, "one InitChain validator per address")
+	powers := map[string]int64{}
+	for _, u := range updates {
+		powers[u.PubKey.String()] = u.Power
+	}
+	require.Equal(t, int64(9), powers[pkA.String()], "the last entry for a repeated pubkey wins")
+	require.Equal(t, int64(3), powers[pkB.String()])
+
+	stored := consumerKeeper.GetAllVaasValidator(ctx)
+	require.Len(t, stored, 2)
+	for _, v := range stored {
+		pk, err := v.ConsPubKey()
+		require.NoError(t, err)
+		tmPk, err := cryptocodec.ToCmtProtoPublicKey(pk)
+		require.NoError(t, err)
+		require.Equal(t, powers[tmPk.String()], v.Power)
 	}
 }
 
@@ -232,7 +273,7 @@ func TestGenesisRoundTripLastVSCRecvTime(t *testing.T) {
 // file's genesis_time, which may predate launch by however long the genesis
 // ceremony took, and arming with it would burn safe-mode budget before the
 // chain produced a block. A restart genesis carrying the exported value keeps
-// it; one without the field arms at the next block the same way; PreVAAS
+// it; one without the field arms at the next block the same way; PreVaas
 // chains stay unarmed until their changeover, since the standalone staking
 // keeper still runs the chain there and VSC staleness is not yet meaningful.
 func TestVSCStalenessClockArmsAtFirstWallClockBlock(t *testing.T) {
@@ -266,16 +307,19 @@ func TestVSCStalenessClockArmsAtFirstWallClockBlock(t *testing.T) {
 
 		genesisTime := time.Unix(1_850_000_000, 0).UTC()
 		launchTime := genesisTime.Add(48 * time.Hour) // ceremony finished long after the file was written
-		ctx = ctx.WithBlockHeight(1).WithBlockTime(genesisTime)
+		// The InitChain context of a chain starting at height 1 carries
+		// height 0; block 1 is the genesis block.
+		ctx = ctx.WithBlockHeight(0).WithBlockTime(genesisTime)
 
 		ck.InitGenesis(ctx, consumertypes.NewInitialGenesisState(provClientState, provConsState, valset, params))
+		require.Equal(t, int64(1), ck.GetInitGenesisHeight(ctx), "the genesis block of a fresh chain is block 1")
 
 		has, err := ck.LastVSCRecvTime.Has(ctx)
 		require.NoError(t, err)
 		require.False(t, has, "InitGenesis must not arm the clock: the genesis timestamp may predate launch")
 
 		// The genesis block itself still carries genesis_time; no arming.
-		ck.ArmVSCStalenessClock(ctx)
+		ck.ArmVSCStalenessClock(ctx.WithBlockHeight(1))
 		has, err = ck.LastVSCRecvTime.Has(ctx)
 		require.NoError(t, err)
 		require.False(t, has, "the genesis block carries genesis_time, not wall-clock time")
@@ -329,8 +373,11 @@ func TestVSCStalenessClockArmsAtFirstWallClockBlock(t *testing.T) {
 			params,
 		)
 		restartTime := time.Unix(1_850_000_000, 0).UTC()
+		// A restart at initial_height 100: the InitChain context carries
+		// that height, and block 100 is the genesis block.
 		ctx = ctx.WithBlockHeight(100).WithBlockTime(restartTime)
 		ck.InitGenesis(ctx, genesis)
+		require.Equal(t, int64(100), ck.GetInitGenesisHeight(ctx))
 
 		// The restart's own genesis block still carries the file's timestamp.
 		ck.ArmVSCStalenessClock(ctx)
@@ -409,8 +456,8 @@ func TestGenesisRoundTripDowntimeState(t *testing.T) {
 	require.NoError(t, err)
 	validator := tmtypes.NewValidator(tmPK, 1)
 
-	addr1 := []byte("validator-addr-downtime-one")
-	addr2 := []byte("validator-addr-downtime-two")
+	addr1 := []byte("validator-downtime-1")
+	addr2 := []byte("validator-downtime-2")
 	bitmap1 := []byte{0xFF, 0x00}
 	bitmap2 := []byte{0x0F, 0xF0}
 	staged := vaastypes.DowntimeParams{
@@ -667,8 +714,6 @@ func TestInitGenesisAcceptsDefaultGenesis(t *testing.T) {
 func TestInitGenesisNewChainCreatesNoClient(t *testing.T) {
 	ck, ctx, ctrl, _ := testkeeper.GetConsumerKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
-	// No CreateClient expectation on the mock: any attempt to create a client
-	// fails the test as an unexpected call.
 
 	provClientState := ibctmtypes.NewClientState(
 		"provider-chain-7", ibctmtypes.DefaultTrustLevel,
@@ -748,4 +793,65 @@ func TestInitGenesisPanicsWhenPinnedClientMissing(t *testing.T) {
 	require.PanicsWithError(t,
 		`init: genesis pins provider client "07-tendermint-9", which does not exist in the IBC client store`,
 		func() { ck.InitGenesis(ctx, genesis) })
+}
+
+// TestGenesisRoundTripHighestValsetUpdateIDRejectsReplayedVSC: the dedup
+// watermark survives an export/import restart, so a VSC packet with an id at
+// or below the last one applied before the restart (one still sitting in IBC
+// state and redelivered afterwards) is skipped instead of being applied over
+// the newer set, while the next higher id is still accepted.
+func TestGenesisRoundTripHighestValsetUpdateIDRejectsReplayedVSC(t *testing.T) {
+	protoPubKey := func() abci.ValidatorUpdate {
+		pk, err := cryptocodec.ToCmtProtoPublicKey(ed25519.GenPrivKey().PubKey())
+		require.NoError(t, err)
+		return abci.ValidatorUpdate{PubKey: pk, Power: 50}
+	}
+	diff := func(id uint64) vaastypes.ValidatorSetChangePacketData {
+		return vaastypes.NewValidatorSetChangePacketData([]abci.ValidatorUpdate{protoPubKey()}, id)
+	}
+
+	pubKey := ed25519.GenPrivKey().PubKey()
+	vaasVal, err := consumertypes.NewVaasValidator(pubKey.Address(), 1, pubKey)
+	require.NoError(t, err)
+
+	ck, ctx, ctrl, mocks := testkeeper.GetConsumerKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+	testkeeper.StubClientState(mocks, "provider-0")
+	ck.SetParams(ctx, vaastypes.DefaultConsumerParams())
+	ck.SetProviderClientID(ctx, liveProviderClientID)
+	ck.SetVaasValidator(ctx, vaasVal)
+	require.NoError(t, ck.OnRecvVSCPacketV2(ctx, liveProviderClientID, diff(7)))
+
+	exported := ck.ExportGenesis(ctx)
+	require.Equal(t, uint64(7), exported.HighestValsetUpdateId, "export must carry the watermark")
+
+	ck2, ctx2, ctrl2, mocks2 := testkeeper.GetConsumerKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl2.Finish()
+	testkeeper.StubClientState(mocks2, "provider-0")
+	ck2.InitGenesis(ctx2, exported)
+
+	highest, found, err := ck2.GetHighestValsetUpdateID(ctx2)
+	require.NoError(t, err)
+	require.True(t, found, "watermark lost across the round-trip")
+	require.Equal(t, uint64(7), highest)
+	require.Equal(t, exported, ck2.ExportGenesis(ctx2), "round-trip must be a fixed point")
+
+	// A lower id and the watermark's own id are both replays.
+	for _, replayed := range []uint64{5, 7} {
+		require.NoError(t, ck2.OnRecvVSCPacketV2(ctx2, liveProviderClientID, diff(replayed)),
+			"replayed id %d is acknowledged without error", replayed)
+		_, staged := ck2.GetPendingChanges(ctx2)
+		require.False(t, staged, "VSC id %d is at or below the restored watermark and must not be applied", replayed)
+		highest, _, err = ck2.GetHighestValsetUpdateID(ctx2)
+		require.NoError(t, err)
+		require.Equal(t, uint64(7), highest)
+	}
+
+	require.NoError(t, ck2.OnRecvVSCPacketV2(ctx2, liveProviderClientID, diff(8)))
+	pending, staged := ck2.GetPendingChanges(ctx2)
+	require.True(t, staged, "the next id is accepted, so the skip above was the watermark's doing")
+	require.Len(t, pending.ValidatorUpdates, 1)
+	highest, _, err = ck2.GetHighestValsetUpdateID(ctx2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(8), highest)
 }

@@ -9,11 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	tmproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	tmtypes "github.com/cometbft/cometbft/types"
 
+	ibcclienttypes "github.com/cosmos/ibc-go/v10/modules/core/02-client/types"
 	ibcexported "github.com/cosmos/ibc-go/v10/modules/core/exported"
 	ibctmtypes "github.com/cosmos/ibc-go/v10/modules/light-clients/07-tendermint"
 
+	"cosmossdk.io/collections"
 	"cosmossdk.io/math"
 
 	cryptocodec "github.com/cosmos/cosmos-sdk/crypto/codec"
@@ -25,6 +28,7 @@ import (
 	cryptotestutil "github.com/allinbits/vaas/testutil/crypto"
 	testkeeper "github.com/allinbits/vaas/testutil/keeper"
 	"github.com/allinbits/vaas/x/vaas/provider/types"
+	vaastypes "github.com/allinbits/vaas/x/vaas/types"
 )
 
 func TestVerifyDoubleVotingEvidence(t *testing.T) {
@@ -1113,4 +1117,176 @@ func TestContainLightClientAttackFailsWhenTheFreezeFails(t *testing.T) {
 	_, err := keeper.ContainLightClientAttackForTest(ctx, consumerID, misbehaviour, nil)
 	require.ErrorContains(t, err, "client refused the update")
 	require.Equal(t, types.CONSUMER_PHASE_LAUNCHED, keeper.GetConsumerPhase(ctx, consumerID))
+}
+
+// TestHandleConsumerMisbehaviourRejectsMisattributedOrStaleHeaders: the
+// checks CheckMisbehaviour makes before consulting the light client. Headers
+// of another chain, a client other than the consumer's declared one, headers
+// at different heights (a time violation, not a fork) and headers below the
+// consumer's evidence minimum height are each refused through the public
+// handler, which leaves the consumer launched. No client-keeper expectation
+// is mocked, so the controller also proves no client was read, frozen or
+// updated for any of them.
+func TestHandleConsumerMisbehaviourRejectsMisattributedOrStaleHeaders(t *testing.T) {
+	const consumerID = uint64(0)
+	const chainID = "consumer-chain"
+	const clientID = "07-tendermint-0"
+	const minHeight = uint64(10)
+
+	header := func(chainID string, height int64) *ibctmtypes.Header {
+		return &ibctmtypes.Header{
+			SignedHeader: &tmproto.SignedHeader{Header: &tmproto.Header{ChainID: chainID, Height: height}},
+		}
+	}
+
+	cases := []struct {
+		name         string
+		misbehaviour ibctmtypes.Misbehaviour
+		wantErr      error
+		wantMessage  string
+	}{
+		{
+			"headers of another chain",
+			ibctmtypes.Misbehaviour{ClientId: clientID, Header1: header("other-chain", 50), Header2: header("other-chain", 50)},
+			nil, "different chain id",
+		},
+		{
+			"a client other than the consumer's",
+			ibctmtypes.Misbehaviour{ClientId: "07-tendermint-9", Header1: header(chainID, 50), Header2: header(chainID, 50)},
+			nil, "expected client ID",
+		},
+		{
+			"headers at different heights",
+			ibctmtypes.Misbehaviour{ClientId: clientID, Header1: header(chainID, 50), Header2: header(chainID, 51)},
+			ibcclienttypes.ErrInvalidMisbehaviour, "not at same height",
+		},
+		{
+			"headers below the evidence minimum height",
+			ibctmtypes.Misbehaviour{ClientId: clientID, Header1: header(chainID, 9), Header2: header(chainID, 9)},
+			vaastypes.ErrInvalidDoubleVotingEvidence, "too old",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			keeper, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+			defer ctrl.Finish()
+			keeper.SetConsumerPhase(ctx, consumerID, types.CONSUMER_PHASE_LAUNCHED)
+			keeper.SetConsumerChainId(ctx, consumerID, chainID)
+			keeper.SetConsumerClientId(ctx, consumerID, clientID)
+			keeper.SetEquivocationEvidenceMinHeight(ctx, consumerID, minHeight)
+
+			_, err := keeper.HandleConsumerMisbehaviour(ctx, consumerID, tc.misbehaviour)
+			require.ErrorContains(t, err, tc.wantMessage)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+			}
+			require.Equal(t, types.CONSUMER_PHASE_LAUNCHED, keeper.GetConsumerPhase(ctx, consumerID),
+				"rejected evidence must not contain the consumer")
+		})
+	}
+}
+
+// TestHandleConsumerDoubleVotingAcceptsPausedAndStoppedConsumers: a pause or
+// a stop does not void a double-sign. Evidence against a paused consumer
+// queues a punishment whose clock starts at the pause, so the thaw lands it
+// one full delay after the resume; evidence against a stopped consumer queues
+// one on the ordinary clock.
+func TestHandleConsumerDoubleVotingAcceptsPausedAndStoppedConsumers(t *testing.T) {
+	for _, phase := range []types.ConsumerPhase{types.CONSUMER_PHASE_PAUSED, types.CONSUMER_PHASE_STOPPED} {
+		t.Run(phase.String(), func(t *testing.T) {
+			providerKeeper, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+			defer ctrl.Finish()
+
+			const (
+				chainID        = "consumer-chain-0"
+				consumerID     = uint64(0)
+				evidenceHeight = int64(100)
+			)
+			now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			pausedAt := now.Add(-time.Hour)
+			ctx = ctx.WithBlockTime(now)
+
+			providerKeeper.SetConsumerPhase(ctx, consumerID, phase)
+			providerKeeper.SetConsumerChainId(ctx, consumerID, chainID)
+			providerKeeper.SetEquivocationEvidenceMinHeight(ctx, consumerID, 5)
+			providerKeeper.SetInfractionParams(ctx, *getTestInfractionParameters())
+			require.NoError(t, providerKeeper.SetConsumerPausedAt(ctx, consumerID, pausedAt))
+
+			signer := tmtypes.NewMockPV()
+			val := tmtypes.NewValidator(signer.PrivKey.PubKey(), 1)
+			valSet := tmtypes.NewValidatorSet([]*tmtypes.Validator{val})
+			valPubkey, err := cryptocodec.FromCmtPubKeyInterface(val.PubKey)
+			require.NoError(t, err)
+			blockID1 := cryptotestutil.MakeBlockID([]byte("blockhash1"), 1000, []byte("partshash"))
+			blockID2 := cryptotestutil.MakeBlockID([]byte("blockhash2"), 1000, []byte("partshash"))
+			evidence := &tmtypes.DuplicateVoteEvidence{
+				VoteA:            cryptotestutil.MakeAndSignVote(blockID1, evidenceHeight, now, valSet, signer, chainID),
+				VoteB:            cryptotestutil.MakeAndSignVote(blockID2, evidenceHeight, now, valSet, signer, chainID),
+				ValidatorPower:   val.VotingPower,
+				TotalVotingPower: val.VotingPower,
+				Timestamp:        now,
+			}
+
+			stakingVal, err := stakingtypes.NewValidator(
+				sdk.ValAddress(valPubkey.Address()).String(), valPubkey, stakingtypes.NewDescription("", "", "", "", ""))
+			require.NoError(t, err)
+			stakingVal.Status = stakingtypes.Bonded
+			stakingVal.Tokens = sdk.DefaultPowerReduction
+			stakingVal.DelegatorShares = math.LegacyNewDecFromInt(sdk.DefaultPowerReduction)
+			consAddr, err := stakingVal.GetConsAddr()
+			require.NoError(t, err)
+
+			mocks.MockStakingKeeper.EXPECT().GetValidatorByConsAddr(gomock.Any(), sdk.ConsAddress(consAddr)).Return(stakingVal, nil).AnyTimes()
+			mocks.MockSlashingKeeper.EXPECT().IsTombstoned(gomock.Any(), sdk.ConsAddress(consAddr)).Return(false).AnyTimes()
+			mocks.MockStakingKeeper.EXPECT().GetUnbondingDelegationsFromValidator(gomock.Any(), gomock.Any()).Return([]stakingtypes.UnbondingDelegation{}, nil).AnyTimes()
+			mocks.MockStakingKeeper.EXPECT().GetRedelegationsFromSrcValidator(gomock.Any(), gomock.Any()).Return([]stakingtypes.Redelegation{}, nil).AnyTimes()
+			mocks.MockStakingKeeper.EXPECT().Jail(gomock.Any(), sdk.ConsAddress(consAddr)).Return(nil).Times(1)
+			mocks.MockSlashingKeeper.EXPECT().GetValidatorSigningInfo(gomock.Any(), sdk.ConsAddress(consAddr)).Return(slashingtypes.ValidatorSigningInfo{}, nil).Times(1)
+			mocks.MockSlashingKeeper.EXPECT().JailUntil(gomock.Any(), sdk.ConsAddress(consAddr), gomock.Any()).Return(nil).Times(1)
+
+			require.NoError(t, providerKeeper.HandleConsumerDoubleVoting(ctx, consumerID, evidence, valPubkey))
+
+			entry, err := providerKeeper.PendingEquivocationPunishments.Get(ctx, collections.Join3(consumerID, sdk.ConsAddress(consAddr).Bytes(), evidenceHeight))
+			require.NoError(t, err, "the evidence must queue a punishment")
+			delay := providerKeeper.GetParams(ctx).EquivocationExecutionDelay
+			if phase == types.CONSUMER_PHASE_PAUSED {
+				require.Equal(t, pausedAt.Add(delay), entry.ExecutesAt, "an entry queued during a pause starts its clock at the pause")
+			} else {
+				require.Equal(t, now.Add(delay), entry.ExecutesAt)
+			}
+		})
+	}
+}
+
+// TestHandleConsumerDoubleVotingRejectsUnlaunchedAndDeletedConsumers: before
+// a launch there is no consumer set to have signed for, and after a deletion
+// the state the evidence resolves through is gone, so both are refused up
+// front, with no validator lookups (nothing is mocked).
+func TestHandleConsumerDoubleVotingRejectsUnlaunchedAndDeletedConsumers(t *testing.T) {
+	for _, phase := range []types.ConsumerPhase{types.CONSUMER_PHASE_REGISTERED, types.CONSUMER_PHASE_INITIALIZED, types.CONSUMER_PHASE_DELETED} {
+		t.Run(phase.String(), func(t *testing.T) {
+			providerKeeper, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+			defer ctrl.Finish()
+			const consumerID = uint64(0)
+			providerKeeper.SetConsumerPhase(ctx, consumerID, phase)
+			err := providerKeeper.HandleConsumerDoubleVoting(ctx, consumerID, &tmtypes.DuplicateVoteEvidence{}, nil)
+			require.ErrorIs(t, err, vaastypes.ErrInvalidDoubleVotingEvidence)
+		})
+	}
+}
+
+// TestHandleConsumerDoubleVotingRefusesAGovernanceRemovedConsumer: a
+// governance removal is the verdict on a consumer's evidence, so evidence
+// submitted after it is refused up front (nothing is mocked), while a stop
+// for any other reason leaves the evidence acceptable (the STOPPED case of
+// TestHandleConsumerDoubleVotingAcceptsPausedAndStoppedConsumers).
+func TestHandleConsumerDoubleVotingRefusesAGovernanceRemovedConsumer(t *testing.T) {
+	providerKeeper, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+	const consumerID = uint64(0)
+	providerKeeper.SetConsumerPhase(ctx, consumerID, types.CONSUMER_PHASE_STOPPED)
+	providerKeeper.MarkConsumerRemovedByGovernance(ctx, consumerID)
+	err := providerKeeper.HandleConsumerDoubleVoting(ctx, consumerID, &tmtypes.DuplicateVoteEvidence{}, nil)
+	require.ErrorIs(t, err, vaastypes.ErrInvalidDoubleVotingEvidence)
+	require.ErrorContains(t, err, "removed by governance")
 }

@@ -95,14 +95,15 @@ func setupDowntimeTestWithTrustingPeriod(
 		return windowEndTime, nil
 	})
 	mocks.MockClientKeeper.EXPECT().GetClientState(gomock.Any(), "07-tendermint-0").
-		Return(&ibctmtypes.ClientState{TrustingPeriod: trustingPeriod}, true).AnyTimes()
+		Return(&ibctmtypes.ClientState{ChainId: "consumer-chain", TrustingPeriod: trustingPeriod}, true).AnyTimes()
 
 	return providerKeeper, ctx, ctrl, mocks, consumerId, providerAddr
 }
 
 // TestHandleConsumerDowntimeRejectsEvidenceTooOldToStayChallengeable: an
 // accusation is accepted only if its whole challenge window fits inside the
-// consumer client's trusting period, counted from the window end, so the
+// consumer client's trusting period, counted from the window's anchor (the
+// shared stub anchors both window boundaries at the same time here), so the
 // accused can still verify a challenge header at the end of it. The
 // parameter-level bound uses the default trusting period; this is what
 // protects a consumer whose client trusts for less.
@@ -139,6 +140,78 @@ func TestHandleConsumerDowntimeRejectsEvidenceTooOldToStayChallengeable(t *testi
 		require.NoError(t, providerKeeper.HandleConsumerEvidencePacket(ctx, consumerId, evidenceFor(providerAddr)))
 		_, err := providerKeeper.PendingDowntimeSlashes.Get(ctx, collections.Join3(consumerId, providerAddr.ToSdkConsAddr().Bytes(), int64(100)))
 		require.NoError(t, err)
+	})
+}
+
+// TestHandleConsumerDowntimeChallengeabilityBoundAnchorsTheWindowStart: the
+// challengeability bound is measured from the window start's anchor, the
+// consensus state a challenge of the window's first height verifies against,
+// which can be up to a whole window of consumer blocks older than the
+// window-end anchor. Evidence whose window end is young enough is still
+// rejected when its window start is not.
+func TestHandleConsumerDowntimeChallengeabilityBoundAnchorsTheWindowStart(t *testing.T) {
+	windowEndTime := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	spawnTime := windowEndTime.Add(-30 * 24 * time.Hour)
+	// max age 72h, challenge window 168h, against a client trusting for 200h;
+	// the evidence is 20h old by its window end, so the end alone would
+	// leave 12h to spare.
+	infractionParams := downtimeParams(8, "0.5", 0, 168*time.Hour, 72*time.Hour)
+	const trustingPeriod = 200 * time.Hour
+	const windowStart, windowEnd = int64(93), int64(100)
+
+	evidenceFor := func(providerAddr types.ProviderConsAddress) vaastypes.EvidencePacketData {
+		return vaastypes.NewEvidencePacketData(providerAddr.ToSdkConsAddr(), windowStart, []byte{0x3F}, 8, 8, math.LegacyMustNewDecFromStr("0.5"))
+	}
+	anchorWindowStart := func(k *providerkeeper.Keeper, lag time.Duration) {
+		k.OverrideWindowEndTimestampForTest(func(_ sdk.Context, _ string, height int64) (time.Time, error) {
+			switch height {
+			case windowEnd:
+				return windowEndTime, nil
+			case windowStart:
+				return windowEndTime.Add(-lag), nil
+			}
+			return time.Time{}, fmt.Errorf("unexpected anchor height %d", height)
+		})
+	}
+
+	t.Run("window start anchored 15h before the end: 20h + 15h + 168h reaches past 200h", func(t *testing.T) {
+		providerKeeper, ctx, ctrl, _, consumerId, providerAddr := setupDowntimeTestWithTrustingPeriod(t, infractionParams, spawnTime, windowEndTime, trustingPeriod)
+		defer ctrl.Finish()
+		anchorWindowStart(&providerKeeper, 15*time.Hour)
+		ctx = ctx.WithBlockTime(windowEndTime.Add(20 * time.Hour))
+
+		err := providerKeeper.HandleConsumerEvidencePacket(ctx, consumerId, evidenceFor(providerAddr))
+		require.ErrorContains(t, err, "window start anchored 35h0m0s ago")
+		_, err = providerKeeper.PendingDowntimeSlashes.Get(ctx, collections.Join3(consumerId, providerAddr.ToSdkConsAddr().Bytes(), windowEnd))
+		require.ErrorIs(t, err, collections.ErrNotFound, "nothing may be queued for a rejected accusation")
+	})
+
+	t.Run("window start anchored 5h before the end: 20h + 5h + 168h still fits", func(t *testing.T) {
+		providerKeeper, ctx, ctrl, mocks, consumerId, providerAddr := setupDowntimeTestWithTrustingPeriod(t, infractionParams, spawnTime, windowEndTime, trustingPeriod)
+		defer ctrl.Finish()
+		anchorWindowStart(&providerKeeper, 5*time.Hour)
+		ctx = ctx.WithBlockTime(windowEndTime.Add(20 * time.Hour))
+		providerKeeper.SetEpochShareRecord(ctx, consumerId, windowEndTime, math.NewInt(1000))
+		mocks.MockPhotonKeeper.EXPECT().ConversionRate(ctx).Return(math.LegacyNewDec(2), nil)
+
+		require.NoError(t, providerKeeper.HandleConsumerEvidencePacket(ctx, consumerId, evidenceFor(providerAddr)))
+		_, err := providerKeeper.PendingDowntimeSlashes.Get(ctx, collections.Join3(consumerId, providerAddr.ToSdkConsAddr().Bytes(), windowEnd))
+		require.NoError(t, err)
+	})
+
+	t.Run("a window start the client cannot anchor is rejected", func(t *testing.T) {
+		providerKeeper, ctx, ctrl, _, consumerId, providerAddr := setupDowntimeTestWithTrustingPeriod(t, infractionParams, spawnTime, windowEndTime, trustingPeriod)
+		defer ctrl.Finish()
+		providerKeeper.OverrideWindowEndTimestampForTest(func(_ sdk.Context, _ string, height int64) (time.Time, error) {
+			if height == windowEnd {
+				return windowEndTime, nil
+			}
+			return time.Time{}, fmt.Errorf("no consensus state at or below %d", height)
+		})
+		ctx = ctx.WithBlockTime(windowEndTime.Add(20 * time.Hour))
+
+		err := providerKeeper.HandleConsumerEvidencePacket(ctx, consumerId, evidenceFor(providerAddr))
+		require.ErrorContains(t, err, "cannot anchor the downtime evidence window start")
 	})
 }
 
@@ -293,7 +366,7 @@ func TestHandleConsumerEvidencePacketRejectsSpanExceedingWindow(t *testing.T) {
 	// Span (8) exceeds the echoed window (4); rejected by
 	// EvidencePacketData.Validate() before HandleConsumerDowntime ever runs.
 	evidencePacket := vaastypes.EvidencePacketData{
-		ValidatorAddr:      sdk.ConsAddress([]byte{0x01, 0x02, 0x03}),
+		ValidatorAddr:      sdk.ConsAddress([]byte("downtime-cons-addr-1")),
 		WindowEndHeight:    107,
 		Infraction:         stakingtypes.Infraction_INFRACTION_DOWNTIME,
 		WindowStartHeight:  100,
@@ -635,7 +708,7 @@ func TestHandleConsumerDowntimeRejectsTooOldEvidence(t *testing.T) {
 	providerKeeper.SetInfractionParams(ctx, downtimeParams(8, "0.5", 0, 7*24*time.Hour, 72*time.Hour))
 
 	evidencePacket := vaastypes.NewEvidencePacketData(
-		sdk.ConsAddress([]byte{0x01, 0x02, 0x03}),
+		sdk.ConsAddress([]byte("downtime-cons-addr-1")),
 		93, // window end height 100, below min height of 200
 		[]byte{0x3F},
 		8,
@@ -699,7 +772,7 @@ func TestHandleConsumerDowntimeRejectsValidatorNotInSet(t *testing.T) {
 
 	// The reporting validator is never registered in the consumer's
 	// validator set.
-	evidencePacket := vaastypes.NewEvidencePacketData(sdk.ConsAddress([]byte{0x01, 0x02, 0x03}), 93, []byte{0x3F}, 8, 8, math.LegacyMustNewDecFromStr("0.5"))
+	evidencePacket := vaastypes.NewEvidencePacketData(sdk.ConsAddress([]byte("downtime-cons-addr-1")), 93, []byte{0x3F}, 8, 8, math.LegacyMustNewDecFromStr("0.5"))
 
 	err := providerKeeper.HandleConsumerEvidencePacket(ctx, consumerId, evidencePacket)
 	require.Error(t, err)
@@ -715,7 +788,7 @@ func TestHandleConsumerEvidencePacketRejectsDoubleSign(t *testing.T) {
 	providerKeeper.SetConsumerPhase(ctx, consumerId, types.CONSUMER_PHASE_LAUNCHED)
 
 	evidencePacket := vaastypes.EvidencePacketData{
-		ValidatorAddr:      sdk.ConsAddress([]byte{0x01, 0x02, 0x03}),
+		ValidatorAddr:      sdk.ConsAddress([]byte("downtime-cons-addr-1")),
 		WindowEndHeight:    100,
 		Infraction:         stakingtypes.Infraction_INFRACTION_DOUBLE_SIGN,
 		WindowStartHeight:  100,
@@ -737,7 +810,7 @@ func TestHandleConsumerEvidencePacketRejectsNonLaunchedConsumer(t *testing.T) {
 	providerKeeper.SetConsumerPhase(ctx, consumerId, types.CONSUMER_PHASE_REGISTERED)
 
 	evidencePacket := vaastypes.NewEvidencePacketData(
-		sdk.ConsAddress([]byte{0x01, 0x02, 0x03}),
+		sdk.ConsAddress([]byte("downtime-cons-addr-1")),
 		100,
 		[]byte{0x01},
 		1,
@@ -762,7 +835,7 @@ func TestHandleConsumerEvidencePacketRejectsPausedConsumer(t *testing.T) {
 	providerKeeper.SetConsumerPhase(ctx, consumerId, types.CONSUMER_PHASE_PAUSED)
 
 	evidencePacket := vaastypes.NewEvidencePacketData(
-		sdk.ConsAddress([]byte{0x01, 0x02, 0x03}),
+		sdk.ConsAddress([]byte("downtime-cons-addr-1")),
 		100,
 		[]byte{0x01},
 		1,

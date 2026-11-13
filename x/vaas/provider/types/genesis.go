@@ -6,6 +6,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cometbft/cometbft/crypto/encoding"
+
+	host "github.com/cosmos/ibc-go/v10/modules/core/24-host"
+
 	errorsmod "cosmossdk.io/errors"
 	"cosmossdk.io/math"
 
@@ -49,13 +53,36 @@ func (gs GenesisState) Validate() error {
 		return errorsmod.Wrap(vaastypes.ErrInvalidGenesis, "valset update ID cannot be equal to zero")
 	}
 
-	seenConsumerIds := map[uint64]bool{}
+	// Consumer ids must be exactly 0..n-1, in any order: the keeper derives
+	// every consumer id from the ConsumerId sequence, which ExportGenesis
+	// enumerates from 0, so a gap would export a phantom consumer with no
+	// phase, chain id, or owner. Distinct ids all below n are that set.
+	//
+	// The per-consumer lists are checked against the consumers that can
+	// carry them: the known ids; the ones not deleted, the deletion clearing
+	// the key assignments and sweeping the fee-pool shares; and the ones that
+	// have launched at some point, the fee distribution writing epoch share
+	// records for launched consumers only and the deletion leaving them to
+	// the age-based prune.
+	known := make(map[uint64]struct{}, len(gs.ConsumerStates))
+	live := make(map[uint64]struct{}, len(gs.ConsumerStates))
+	everLaunched := make(map[uint64]struct{}, len(gs.ConsumerStates))
 	for _, cs := range gs.ConsumerStates {
-		if seenConsumerIds[cs.ConsumerId] {
+		if _, seen := known[cs.ConsumerId]; seen {
 			return errorsmod.Wrap(vaastypes.ErrInvalidGenesis,
 				fmt.Sprintf("duplicate consumer id %d in genesis", cs.ConsumerId))
 		}
-		seenConsumerIds[cs.ConsumerId] = true
+		if cs.ConsumerId >= uint64(len(gs.ConsumerStates)) {
+			return errorsmod.Wrap(vaastypes.ErrInvalidGenesis,
+				fmt.Sprintf("consumer ids must be contiguous from 0: got consumer id %d among %d consumer states", cs.ConsumerId, len(gs.ConsumerStates)))
+		}
+		known[cs.ConsumerId] = struct{}{}
+		if cs.Phase != CONSUMER_PHASE_DELETED {
+			live[cs.ConsumerId] = struct{}{}
+		}
+		if !cs.Phase.Prelaunched() {
+			everLaunched[cs.ConsumerId] = struct{}{}
+		}
 		if err := cs.Validate(); err != nil {
 			return errorsmod.Wrap(vaastypes.ErrInvalidGenesis,
 				fmt.Sprintf("%s: for consumer id %d (chain id %q)", err, cs.ConsumerId, cs.ChainId))
@@ -69,19 +96,36 @@ func (gs GenesisState) Validate() error {
 	if err := KeyAssignmentValidateBasic(gs.ValidatorConsumerPubkeys,
 		gs.ValidatorsByConsumerAddr,
 		gs.ConsumerAddrsToPrune,
+		live,
 	); err != nil {
 		return err
-	}
-
-	// Build a set of known consumer ids from consumer_states.
-	known := make(map[uint64]struct{}, len(gs.ConsumerStates))
-	for _, cs := range gs.ConsumerStates {
-		known[cs.ConsumerId] = struct{}{}
 	}
 	// Overrides must reference a known consumer and stay strictly above the
 	// module-wide fees_per_block floor (the same invariant the msg handler and
 	// UpdateParams reconciliation enforce at runtime).
 	floor := gs.Params.FeesPerBlockAmount
+	// A chain id a consumer carried before a rename stays its evidence
+	// domain until its deletion: no other consumer may hold it, as its
+	// current id or as one of its own previous ids.
+	currentChainIds := map[string]uint64{}
+	for _, cs := range gs.ConsumerStates {
+		if cs.ChainId != "" {
+			currentChainIds[cs.ChainId] = cs.ConsumerId
+		}
+	}
+	previousChainIds := map[string]uint64{}
+	for _, cs := range gs.ConsumerStates {
+		for _, previous := range cs.PreviousChainIds {
+			if holder, ok := currentChainIds[previous.ChainId]; ok {
+				return fmt.Errorf("consumer %d's previous chain id %q is consumer %d's chain id", cs.ConsumerId, previous.ChainId, holder)
+			}
+			if holder, ok := previousChainIds[previous.ChainId]; ok && holder != cs.ConsumerId {
+				return fmt.Errorf("consumer %d's previous chain id %q is also consumer %d's", cs.ConsumerId, previous.ChainId, holder)
+			}
+			previousChainIds[previous.ChainId] = cs.ConsumerId
+		}
+	}
+
 	for _, ov := range gs.ConsumerFeesPerBlockOverrides {
 		amt, ok := math.NewIntFromString(ov.Amount)
 		if !ok {
@@ -95,7 +139,7 @@ func (gs GenesisState) Validate() error {
 		}
 	}
 
-	if err := validateConsumerFeePoolShares(gs.ConsumerFeePoolShares, seenConsumerIds); err != nil {
+	if err := validateConsumerFeePoolShares(gs.ConsumerFeePoolShares, live); err != nil {
 		return errorsmod.Wrap(vaastypes.ErrInvalidGenesis, err.Error())
 	}
 
@@ -107,13 +151,9 @@ func (gs GenesisState) Validate() error {
 		return errorsmod.Wrap(vaastypes.ErrInvalidGenesis, err.Error())
 	}
 
-	for _, r := range gs.EpochShareRecords {
-		if r.Share.IsNil() || r.Share.IsNegative() {
-			return errorsmod.Wrap(vaastypes.ErrInvalidGenesis,
-				"epoch share record: share cannot be nil or negative")
-		}
+	if err := validateEpochShareRecords(gs.EpochShareRecords, everLaunched); err != nil {
+		return errorsmod.Wrap(vaastypes.ErrInvalidGenesis, err.Error())
 	}
-
 	if err := validateWithheldFeeRecords(gs.WithheldFeeRecords, known); err != nil {
 		return errorsmod.Wrap(vaastypes.ErrInvalidGenesis, err.Error())
 	}
@@ -147,10 +187,12 @@ func (gs GenesisState) Validate() error {
 
 // validateConsumerFeePoolShares rejects malformed share records before
 // InitGenesis would otherwise panic on them: bad bech32, empty denom,
-// non-positive shares, duplicate (consumer, depositor, denom) triples,
-// and orphan consumer ids not present in ConsumerStates.
+// non-positive shares, duplicate (consumer, depositor, denom) triples, and
+// consumer ids unknown or deleted (the deletion sweeps the pool and clears
+// its shares, see SweepConsumerFeePool; a pool imported for a deleted
+// consumer would never be swept again).
 func validateConsumerFeePoolShares(
-	shares []ConsumerFeePoolShare, knownConsumerIds map[uint64]bool,
+	shares []ConsumerFeePoolShare, liveConsumerIds map[uint64]struct{},
 ) error {
 	type triple struct {
 		consumerId uint64
@@ -175,8 +217,8 @@ func validateConsumerFeePoolShares(
 			return fmt.Errorf("non-positive shares for consumer %d depositor %s denom %s: %s",
 				s.ConsumerId, s.Depositor, s.Denom, s.Shares)
 		}
-		if !knownConsumerIds[s.ConsumerId] {
-			return fmt.Errorf("share record references unknown consumer %d", s.ConsumerId)
+		if _, ok := liveConsumerIds[s.ConsumerId]; !ok {
+			return fmt.Errorf("share record references unknown or deleted consumer %d", s.ConsumerId)
 		}
 		k := triple{s.ConsumerId, s.Depositor, s.Denom}
 		if seen[k] {
@@ -188,9 +230,39 @@ func validateConsumerFeePoolShares(
 	return nil
 }
 
+// validateEpochShareRecords rejects records with a nil or negative share,
+// records of a consumer that is unknown or never launched (the fee
+// distribution writes them for launched consumers only, see
+// SetEpochShareRecord; a deleted consumer keeps its records until the
+// age-based prune), and duplicate (consumer_id, distributed_at) entries,
+// which the keeper's collection key cannot represent.
+func validateEpochShareRecords(records []EpochShareRecord, everLaunchedConsumerIds map[uint64]struct{}) error {
+	type key struct {
+		consumerId    uint64
+		distributedAt int64
+	}
+	seen := map[key]bool{}
+	for _, r := range records {
+		if r.Share.IsNil() || r.Share.IsNegative() {
+			return fmt.Errorf("epoch share record: share cannot be nil or negative")
+		}
+		if _, ok := everLaunchedConsumerIds[r.ConsumerId]; !ok {
+			return fmt.Errorf("epoch share record references consumer %d, which is unknown or never launched", r.ConsumerId)
+		}
+		k := key{r.ConsumerId, r.DistributedAtUnixNano}
+		if seen[k] {
+			return fmt.Errorf("duplicate epoch share record for consumer %d distributed at %d", r.ConsumerId, r.DistributedAtUnixNano)
+		}
+		seen[k] = true
+	}
+	return nil
+}
+
 // validatePendingDowntimeSlashes rejects malformed pending downtime slash
 // entries: empty provider cons addr, nil/negative slash tokens, a
-// missed-blocks bitmap whose length does not match ceil(span/8), orphan
+// missed-blocks bitmap whose length does not match ceil(span/8), a zero
+// matures_at (the entry would execute at the first sweep, skipping its
+// challenge window), orphan
 // consumer references, duplicate (consumer_id, provider_cons_addr,
 // window_end_height) entries -- which the keeper's collection key cannot
 // represent (the second entry would silently overwrite the first at
@@ -221,6 +293,9 @@ func validatePendingDowntimeSlashes(slashes []PendingDowntimeSlash, knownConsume
 		}
 		if p.Span <= 0 {
 			return fmt.Errorf("pending downtime slash: span must be positive (consumer=%d)", p.ConsumerId)
+		}
+		if p.MaturesAt.IsZero() {
+			return fmt.Errorf("pending downtime slash: matures at cannot be zero (consumer=%d)", p.ConsumerId)
 		}
 		if wantLen := int((p.Span + 7) / 8); len(p.MissedBlocksBitmap) != wantLen {
 			return fmt.Errorf(
@@ -496,6 +571,34 @@ func validateEpochDowntimeEntries(entries []EpochDowntimeEntry, knownConsumerIds
 	return nil
 }
 
+// validateConsumerValidatorSet checks the exported per-consumer validator
+// set: every entry names a provider consensus address once, carries positive
+// power, and a consensus pubkey CometBFT can decode (the set is what the
+// consumer's CometBFT runs, and what a restarted provider judges evidence
+// against).
+func validateConsumerValidatorSet(set []ConsensusValidator) error {
+	seen := map[string]bool{}
+	for i, v := range set {
+		if len(v.ProviderConsAddr) == 0 {
+			return fmt.Errorf("validator set entry %d: provider cons addr cannot be empty", i)
+		}
+		if seen[string(v.ProviderConsAddr)] {
+			return fmt.Errorf("validator set entry %d: duplicate provider cons addr %x", i, v.ProviderConsAddr)
+		}
+		seen[string(v.ProviderConsAddr)] = true
+		if v.Power <= 0 {
+			return fmt.Errorf("validator set entry %d: power must be positive, got %d", i, v.Power)
+		}
+		if v.PublicKey == nil {
+			return fmt.Errorf("validator set entry %d: consensus pubkey cannot be nil", i)
+		}
+		if _, err := encoding.PubKeyFromProto(*v.PublicKey); err != nil {
+			return fmt.Errorf("validator set entry %d: undecodable consensus pubkey: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // Validate performs a phase-aware consumer state validation.
 // Each phase has different required and forbidden fields, mirroring the
 // invariants the keeper maintains (see x/vaas/provider/keeper/consumer_lifecycle.go).
@@ -516,27 +619,67 @@ func (cs ConsumerState) Validate() error {
 	if _, err := sdk.AccAddressFromBech32(cs.OwnerAddress); err != nil {
 		return fmt.Errorf("invalid owner address %q: %w", cs.OwnerAddress, err)
 	}
-	for _, pVSC := range cs.PendingValsetChanges {
-		if pVSC.ValsetUpdateId == 0 {
-			return errors.New("valset update ID cannot be equal to zero")
+	for i, pVSC := range cs.PendingValsetChanges {
+		if err := pVSC.Validate(); err != nil {
+			return fmt.Errorf("pending valset change %d: %w", i, err)
 		}
+	}
+	if err := validateConsumerValidatorSet(cs.ValidatorSet); err != nil {
+		return err
+	}
+	if cs.HighestAckedVscId > cs.HighestSentVscId {
+		return fmt.Errorf("highest acked vsc id %d exceeds highest sent vsc id %d", cs.HighestAckedVscId, cs.HighestSentVscId)
+	}
+	// VSC packets are queued for a launched consumer and cleared by the send
+	// that delivers them or by the deletion; a pause or a stop leaves them
+	// where they are (see QueueVSCPackets and DeleteConsumerChain).
+	if len(cs.PendingValsetChanges) > 0 && (cs.Phase.Prelaunched() || cs.Phase == CONSUMER_PHASE_DELETED) {
+		return fmt.Errorf("pending valset changes must be empty for phase %s", cs.Phase)
+	}
+
+	if cs.RemovedByGovernance && cs.Phase != CONSUMER_PHASE_STOPPED {
+		return fmt.Errorf("removed by governance is only set on a stopped consumer, phase is %s", cs.Phase)
+	}
+
+	seenPrevious := map[string]bool{}
+	for i, previous := range cs.PreviousChainIds {
+		if previous.ChainId == "" {
+			return fmt.Errorf("previous chain id %d: chain id cannot be empty", i)
+		}
+		if previous.ChainId == cs.ChainId {
+			return fmt.Errorf("previous chain id %d: %q is the consumer's current chain id", i, previous.ChainId)
+		}
+		if previous.Boundary.IsZero() {
+			return fmt.Errorf("previous chain id %d: boundary cannot be zero", i)
+		}
+		if seenPrevious[previous.ChainId] {
+			return fmt.Errorf("previous chain id %d: duplicate chain id %q", i, previous.ChainId)
+		}
+		seenPrevious[previous.ChainId] = true
+	}
+	if len(cs.PreviousChainIds) > 0 && cs.Phase.Prelaunched() {
+		return fmt.Errorf("previous chain ids are only set after launch, phase is %s", cs.Phase)
 	}
 
 	switch cs.Phase {
 	case CONSUMER_PHASE_REGISTERED:
-		// Pre-launch: no IBC client, no consumer genesis, no init params, no removal time.
+		// Pre-launch: no IBC client, no consumer genesis, no removal time, no
+		// validator set. Initialization parameters are allowed: CreateConsumer
+		// stores them (defaulted when the message carries none) and a consumer
+		// without a spawn time stays registered with them.
 		if cs.ClientId != "" {
 			return fmt.Errorf("client id must be empty for phase %s", cs.Phase)
 		}
-		if cs.InitParams != nil {
-			return fmt.Errorf("init params must be empty for phase %s", cs.Phase)
-		}
 		if cs.RemovalTime != nil {
 			return fmt.Errorf("removal time must be empty for phase %s", cs.Phase)
+		}
+		if len(cs.ValidatorSet) > 0 {
+			return fmt.Errorf("validator set must be empty for phase %s", cs.Phase)
 		}
 
 	case CONSUMER_PHASE_INITIALIZED:
-		// Pre-launch but configured: init_params required; still no IBC client.
+		// Pre-launch but configured: init_params required; still no IBC client
+		// and no validator set.
 		if cs.InitParams == nil {
 			return fmt.Errorf("init params required for phase %s", cs.Phase)
 		}
@@ -546,14 +689,17 @@ func (cs ConsumerState) Validate() error {
 		if cs.RemovalTime != nil {
 			return fmt.Errorf("removal time must be empty for phase %s", cs.Phase)
 		}
+		if len(cs.ValidatorSet) > 0 {
+			return fmt.Errorf("validator set must be empty for phase %s", cs.Phase)
+		}
 
 	case CONSUMER_PHASE_LAUNCHED:
-		// Live: init_params + IBC client + consumer genesis all required.
+		// Live: init_params and consumer genesis required. The IBC client is
+		// declared by the owner once the consumer has launched (see
+		// SetConsumerClient), so it may still be absent; its form is checked
+		// below.
 		if cs.InitParams == nil {
 			return fmt.Errorf("init params required for phase %s", cs.Phase)
-		}
-		if cs.ClientId == "" {
-			return fmt.Errorf("client id required for phase %s", cs.Phase)
 		}
 		if err := cs.ConsumerGenesis.Validate(); err != nil {
 			return err
@@ -563,12 +709,11 @@ func (cs ConsumerState) Validate() error {
 		}
 
 	case CONSUMER_PHASE_STOPPED:
-		// Scheduled for removal: LAUNCHED requirements plus a removal time.
+		// Scheduled for removal: the LAUNCHED requirements plus a removal time.
+		// The liveness sweep stops a consumer whose client was never declared,
+		// so the client id may be absent here too.
 		if cs.InitParams == nil {
 			return fmt.Errorf("init params required for phase %s", cs.Phase)
-		}
-		if cs.ClientId == "" {
-			return fmt.Errorf("client id required for phase %s", cs.Phase)
 		}
 		if err := cs.ConsumerGenesis.Validate(); err != nil {
 			return err
@@ -578,14 +723,13 @@ func (cs ConsumerState) Validate() error {
 		}
 
 	case CONSUMER_PHASE_PAUSED:
-		// Live but paused (see PauseConsumerChain): LAUNCHED requirements plus
-		// a scheduled auto-stop time; mutually exclusive with removal_time
-		// since a consumer is never both PAUSED and STOPPED at once.
+		// Live but paused (see PauseConsumerChain): the LAUNCHED requirements
+		// plus a scheduled auto-stop time; mutually exclusive with removal_time
+		// since a consumer is never both PAUSED and STOPPED at once. A
+		// challenge or refusal pause can hold a consumer whose client was
+		// never declared; a light-client pause cannot (see below).
 		if cs.InitParams == nil {
 			return fmt.Errorf("init params required for phase %s", cs.Phase)
-		}
-		if cs.ClientId == "" {
-			return fmt.Errorf("client id required for phase %s", cs.Phase)
 		}
 		if err := cs.ConsumerGenesis.Validate(); err != nil {
 			return err
@@ -618,6 +762,13 @@ func (cs ConsumerState) Validate() error {
 		return fmt.Errorf("invalid phase: %s", cs.Phase)
 	}
 
+	// A declared client id is an ibc-go client identifier.
+	if cs.ClientId != "" {
+		if err := host.ClientIdentifierValidator(cs.ClientId); err != nil {
+			return fmt.Errorf("invalid client id %q: %w", cs.ClientId, err)
+		}
+	}
+
 	// The pause reason and the pause time live exactly as long as the pause
 	// (see PauseConsumerChain).
 	if _, known := PauseReason_name[int32(cs.PauseReason)]; !known {
@@ -634,6 +785,29 @@ func (cs ConsumerState) Validate() error {
 	}
 	if cs.Phase != CONSUMER_PHASE_PAUSED && cs.PausedAt != nil {
 		return fmt.Errorf("paused at must be empty for phase %s", cs.Phase)
+	}
+	// The time the fork became known lives exactly as long as a light-client
+	// pause, and a fork found during a pause is found no earlier than it began
+	// (see escalatePauseToLightClientAttack). Such a pause always has a
+	// client: the one found frozen (see containLightClientAttack and
+	// PauseConsumersWithFrozenClients).
+	lightClientPause := cs.Phase == CONSUMER_PHASE_PAUSED && cs.PauseReason == PAUSE_REASON_LIGHT_CLIENT_ATTACK
+	if lightClientPause && cs.ClientId == "" {
+		return fmt.Errorf("client id required for a %s pause", PAUSE_REASON_LIGHT_CLIENT_ATTACK)
+	}
+	if lightClientPause && cs.ForkKnownAt == nil {
+		return fmt.Errorf("fork known at required for a %s pause", PAUSE_REASON_LIGHT_CLIENT_ATTACK)
+	}
+	if !lightClientPause && cs.ForkKnownAt != nil {
+		return fmt.Errorf("fork known at must be empty unless paused for %s", PAUSE_REASON_LIGHT_CLIENT_ATTACK)
+	}
+	if lightClientPause && cs.ForkKnownAt.Before(*cs.PausedAt) {
+		return fmt.Errorf("fork known at %s precedes paused at %s", cs.ForkKnownAt, cs.PausedAt)
+	}
+	// A client is recovered since the fork only while a light-client pause
+	// lasts (see trackForkDuringLightClientPause).
+	if cs.ClientRecoveredSinceFork && !lightClientPause {
+		return fmt.Errorf("client recovered since fork must be unset unless paused for %s", PAUSE_REASON_LIGHT_CLIENT_ATTACK)
 	}
 
 	return nil

@@ -12,6 +12,7 @@ import (
 	tmproto "github.com/cometbft/cometbft/proto/tendermint/types"
 
 	dbm "github.com/cosmos/cosmos-db"
+	"github.com/cosmos/gogoproto/proto"
 	clientv2types "github.com/cosmos/ibc-go/v10/modules/core/02-client/v2/types"
 	ibctmtypes "github.com/cosmos/ibc-go/v10/modules/light-clients/07-tendermint"
 
@@ -19,6 +20,7 @@ import (
 	"cosmossdk.io/store"
 	"cosmossdk.io/store/metrics"
 	storetypes "cosmossdk.io/store/types"
+	"cosmossdk.io/x/tx/signing"
 
 	"github.com/cosmos/cosmos-sdk/codec"
 	"github.com/cosmos/cosmos-sdk/codec/address"
@@ -65,8 +67,21 @@ func NewInMemKeeperParams(tb testing.TB) InMemKeeperParams {
 	stateStore.MountStoreWithDB(memStoreKey, storetypes.StoreTypeMemory, nil)
 	require.NoError(tb, stateStore.LoadLatestVersion())
 
-	registry := codectypes.NewInterfaceRegistry()
+	// The registry carries address codecs like the apps' do, so a keeper
+	// that reads a message's signers (the consumer's OwnerExec) can.
+	registry, err := codectypes.NewInterfaceRegistryWithOptions(codectypes.InterfaceRegistryOptions{
+		ProtoFiles: proto.HybridResolver,
+		SigningOptions: signing.Options{
+			AddressCodec:          address.NewBech32Codec("cosmos"),
+			ValidatorAddressCodec: address.NewBech32Codec("cosmosvaloper"),
+		},
+	})
+	require.NoError(tb, err)
 	cryptocodec.RegisterInterfaces(registry)
+	// The provider decodes tendermint consensus states straight from the IBC
+	// client store through this codec (windowEndTimestamp), so tests that seed
+	// real consensus states need the 07-tendermint types on the registry.
+	ibctmtypes.RegisterInterfaces(registry)
 	// Gov proposals carry their messages as Any; unpacking a stored
 	// MsgRemoveConsumer needs the provider's msg types on the registry.
 	providertypes.RegisterInterfaces(registry)
@@ -103,9 +118,9 @@ type MockedKeepers struct {
 	// ClientCounterparties backs the mocked ClientV2Keeper's
 	// GetClientCounterparty: a client id present in the map has a registered
 	// counterparty, any other id does not. Tests exercising client
-	// authentication (the provider's discovery content check, the consumer's
+	// authentication (the provider's client declaration check, the consumer's
 	// provider-client pin) populate it to mark specific clients routable;
-	// the empty default preserves the historical "no counterparty" behavior.
+	// with the empty default no client has a counterparty.
 	ClientCounterparties map[string]clientv2types.CounterpartyInfo
 
 	// pendingRotations holds what GetBlockConsPubKeyRotationHistory reports:
@@ -204,7 +219,6 @@ func NewInMemConsumerKeeper(params InMemKeeperParams, mocks MockedKeepers) consu
 		mocks.MockClientKeeper,
 		mocks.MockClientV2Keeper,
 		mocks.MockChannelV2Keeper,
-		mocks.MockSlashingKeeper,
 		mocks.MockBankKeeper,
 		mocks.MockAccountKeeper,
 		authtypes.FeeCollectorName,
@@ -242,13 +256,6 @@ func GetConsumerKeeperAndCtx(t *testing.T, params InMemKeeperParams) (
 	ctrl := gomock.NewController(t)
 	mocks := NewMockedKeepers(ctrl)
 	return NewInMemConsumerKeeper(params, mocks), params.Ctx, ctrl, mocks
-}
-
-func ExpectCreateClientMock(ctx sdk.Context, mocks MockedKeepers, clientType, clientID string,
-	clientState, consState []byte,
-) *gomock.Call {
-	return mocks.MockClientKeeper.EXPECT().CreateClient(ctx, clientType, clientState, consState).Return(clientID,
-		nil).Times(1)
 }
 
 // StubClientState makes every call to the mocked ClientKeeper's GetClientState

@@ -2,7 +2,7 @@
 
 ## What This Is
 
-VAAS (Validator-as-a-Service) is a simplified Interchain Security (ICS) implementation for Cosmos blockchains, derived from [interchain-security](https://github.com/cosmos/interchain-security). It lets a provider chain lease its proof-of-stake security to consumer chains via automatic validator synchronization. All active validators validate all consumers — no opt-in/opt-out.
+VAAS (Validator-as-a-Service) is a simplified Interchain Security (ICS) implementation for Cosmos blockchains, derived from [interchain-security](https://github.com/cosmos/interchain-security). It lets a provider chain lease its proof-of-stake security to consumer chains via automatic validator synchronization. All active validators validate all consumers; there is no opt-in or opt-out.
 
 VAAS runs on **IBC v2 only** (client-based, out-of-order). There is no IBC v1 channel handshake; the VAAS modules register on `ibcRouterV2` under application IDs `vaasprovider` and `vaasconsumer` (see [x/vaas/types/keys.go](x/vaas/types/keys.go)). Consumer launch relies on a relayer (ts-relayer in localnet and e2e) creating IBC v2 clients on both sides; the consumer's owner then declares them on each chain, and the provider serves the declared client from the next epoch boundary.
 
@@ -10,11 +10,16 @@ VAAS runs on **IBC v2 only** (client-based, out-of-order). There is no IBC v1 ch
 
 ```bash
 make build              # go build ./...
-make test               # all unit tests (excludes e2e), 25m timeout
+make build-apps         # provider + consumer binaries into build/; MIN_VOTING_PERIOD=30s lowers atomone-sdk's gov floor
+make test               # unit tests of the root, app and tests/e2e/forge modules (no e2e suites), 25m timeout each
 make lint               # golangci-lint via devdeps/go.mod
 make lint-fix           # auto-fix lint issues
 make mocks-gen          # regenerate mocks from x/vaas/types/expected_keepers.go
-make vulncheck          # govulncheck
+make vulncheck          # govulncheck on the root and app modules (CI Vulncheck job)
+make tidy               # go mod tidy in every module (root, app, tests/e2e, tests/e2e/forge, devdeps)
+make check-tidy         # fail when make tidy would change a go.mod or go.sum (CI Build job)
+make check-e2e-matrix   # fail when an e2e suite is missing from ci.yml's e2e matrix (CI Build job)
+make check-forge-replaces  # fail when tests/e2e/forge/go.mod's replaces differ from app/go.mod's (run by make lint)
 
 # Single test
 go test ./x/vaas/provider/keeper -run TestConsumerClientId -v
@@ -30,7 +35,8 @@ make localnet-clean     # stop all, clean data
 
 # E2E (Docker-based)
 make docker-build-all   # build chain image (ts-relayer image is pulled)
-make test-e2e           # run e2e suite
+make test-e2e           # run the e2e suites (all but the byzantine-consumer one)
+make test-e2e-forge     # build the forge image and run the byzantine-consumer suite
 ```
 
 Dev tool dependencies are isolated in `devdeps/go.mod` and invoked via `go run -modfile devdeps/go.mod`.
@@ -41,24 +47,24 @@ Dev tool dependencies are isolated in `devdeps/go.mod` and invoked via `go run -
 
 The core protocol lives in `x/vaas/` with two symmetric modules:
 
-- **`x/vaas/provider/`** — runs on the provider chain. Manages consumer lifecycle, generates VSC (Validator Set Change) packets at epoch boundaries, handles key assignment, processes double-voting evidence.
-- **`x/vaas/consumer/`** — runs on consumer chains. Receives VSC packets, maintains VAAS validator set, reports evidence back to provider.
-- **`x/vaas/types/`** — shared types, errors, constants, and `expected_keepers.go` (interfaces for external dependencies like staking/slashing).
+- **`x/vaas/provider/`**: runs on the provider chain. Manages consumer lifecycle, generates VSC (Validator Set Change) packets at epoch boundaries, handles key assignment, processes double-voting evidence.
+- **`x/vaas/consumer/`**: runs on consumer chains. Receives VSC packets, maintains VAAS validator set, reports evidence back to provider.
+- **`x/vaas/types/`**: shared types, errors, constants, and `expected_keepers.go` (interfaces for external dependencies like staking/slashing).
 
 Each module has: `keeper/` (business logic + state), `types/` (data structures + params), `client/cli/` (CLI commands), `module.go`, and `ibc_module.go` (IBC v2 callbacks implementing `api.IBCModule` from `ibc-go/v10/modules/core/api`).
 
 Two helper modules replace the standard Cosmos modules on the **provider** app so the staking module does not push its own validator-set updates to CometBFT -- the VAAS provider module computes and returns the provider validator set itself, in `EndBlock`:
 
-- `x/vaas/no_valupdates_staking/` — staking without EndBlock valset exports
-- `x/vaas/no_valupdates_genutil/` — genutil without gentx-based valset init
+- `x/vaas/no_valupdates_staking/`: staking without EndBlock valset exports
+- `x/vaas/no_valupdates_genutil/`: genutil without gentx-based valset init
 
 The consumer app wires neither: it runs no real staking module and uses stock `genutil` with the `ConsumerKeeper` standing in as a no-op staking keeper, so a consumer's validator set is driven entirely by incoming VSC packets.
 
 ### Application Layer
 
-- **`app/provider/`** — full Cosmos SDK app for the provider chain
-- **`app/consumer/`** — full Cosmos SDK app for consumer chains
-- **`app/cmd/`** — binary entry points (`provider` and `consumer` daemons)
+- **`app/provider/`**: full Cosmos SDK app for the provider chain
+- **`app/consumer/`**: full Cosmos SDK app for consumer chains
+- **`app/cmd/`**: binary entry points (`provider` and `consumer` daemons)
 
 Built with `make build-apps` into `build/`.
 
@@ -73,9 +79,10 @@ Built with `make build-apps` into `build/`.
 ### Consumer Lifecycle
 
 `REGISTERED -> INITIALIZED -> LAUNCHED -> STOPPED -> DELETED`, plus a `PAUSED`
-branch off `LAUNCHED` (entered by a successful downtime challenge or by the
-bonded power refusing the consumer reaching `refusal_pause_threshold`;
-governance resumes it to `LAUNCHED` or removes it to `STOPPED`).
+branch off `LAUNCHED` (entered by a successful downtime challenge, by a
+confirmed light-client attack, by the bonded power refusing the consumer
+reaching `refusal_pause_threshold`, or by its declared client tracking another
+chain id; governance resumes it to `LAUNCHED` or removes it to `STOPPED`).
 
 Managed on the provider via `MsgCreateConsumer`, `MsgUpdateConsumer`,
 `MsgRemoveConsumer`, `MsgChallengeConsumerDowntime`, `MsgSetConsumerRefusal`,
@@ -96,7 +103,7 @@ Under `proto/vaas/`: `v1/` (shared wire types like `ValidatorSetChangePacketData
 
 - **Unit tests**: alongside source in `*_test.go`. Use `testutil/keeper/unit_test_helpers.go` for in-memory keeper setup with `MockedKeepers` (gomock).
 - **Mock generation**: `make mocks-gen` from `x/vaas/types/expected_keepers.go` -> `testutil/keeper/mocks.go`
-- **E2E tests**: `tests/e2e/` — Docker-based, spins up real provider/consumer chains plus the `ghcr.io/allinbits/ibc-v2-ts-relayer` container; see [tests/e2e/e2e_tsrelayer_test.go](tests/e2e/e2e_tsrelayer_test.go).
+- **E2E tests**: `tests/e2e/`: Docker-based, spins up real provider/consumer chains plus the `ghcr.io/allinbits/ibc-v2-ts-relayer` container; see [tests/e2e/e2e_tsrelayer_test.go](tests/e2e/e2e_tsrelayer_test.go).
 
 ## Lint / Import Ordering
 

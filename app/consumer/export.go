@@ -10,7 +10,6 @@ import (
 	cryptocodec "github.com/cosmos/cosmos-sdk/crypto/codec"
 	servertypes "github.com/cosmos/cosmos-sdk/server/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
 )
 
 // ExportAppStateAndValidators implements the simapp app interface
@@ -27,7 +26,7 @@ func (app *App) ExportAppStateAndValidators(
 	ctx := app.NewContextLegacy(true, cmtproto.Header{Height: app.LastBlockHeight()})
 
 	// We export at last height + 1, because that's the height at which
-	// Tendermint will start InitChain.
+	// CometBFT will start InitChain.
 	height := app.LastBlockHeight() + 1
 	if forZeroHeight {
 		height = 0
@@ -56,36 +55,17 @@ func (app *App) ExportAppStateAndValidators(
 	}, nil
 }
 
-// prepare for fresh start at zero height
-// NOTE zero height genesis is a temporary feature which will be deprecated
+// prepForZeroHeightGenesis prepares the exported state for a fresh start at
+// height zero.
 //
-//	in favour of export at a block height
-//
-// A consumer chain wires no staking module: its validator set comes from the
-// provider over VSC packets, so the exporter's jail-allowed list has nothing to
-// act on here and only the slashing state needs a reset.
+// A consumer chain wires no staking module and no x/slashing: its validator
+// set comes from the provider over VSC packets, so the exporter's jail-allowed
+// list has nothing to act on here. What is height-relative is the VAAS
+// downtime window in progress.
 func (app *App) prepForZeroHeightGenesis(ctx sdk.Context) {
-	/* Handle slashing state. */
-
-	// reset start height on signing infos
-	var setErr error
-	err := app.SlashingKeeper.IterateValidatorSigningInfos(
-		ctx,
-		func(addr sdk.ConsAddress, info slashingtypes.ValidatorSigningInfo) (stop bool) {
-			info.StartHeight = 0
-			if err := app.SlashingKeeper.SetValidatorSigningInfo(ctx, addr, info); err != nil {
-				setErr = err
-				return true
-			}
-			return false
-		},
-	)
-	if setErr != nil {
-		panic(setErr)
-	}
-	if err != nil {
-		panic(err)
-	}
+	// The open window's bitmaps and first-tracked heights are keyed on the
+	// exporting chain's heights; the relaunch starts a fresh window.
+	app.ConsumerKeeper.ResetMissedBlockTracking(ctx)
 }
 
 // GetValidatorSet returns the consumer's cross-chain validators. The set may be

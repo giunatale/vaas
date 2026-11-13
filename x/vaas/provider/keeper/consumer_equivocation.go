@@ -36,28 +36,83 @@ func (k Keeper) HandleConsumerDoubleVoting(
 	evidence *tmtypes.DuplicateVoteEvidence,
 	pubkey cryptotypes.PubKey,
 ) error {
-	// check that the evidence is for an ICS consumer chain
-	if k.GetConsumerPhase(ctx, consumerId) != types.CONSUMER_PHASE_LAUNCHED {
+	if err := k.checkDoubleVotingConsumerPhase(ctx, consumerId); err != nil {
+		return err
+	}
+	chainId, err := k.GetConsumerChainId(ctx, consumerId)
+	if err != nil {
+		return err
+	}
+	return k.HandleConsumerDoubleVotingOver(ctx, consumerId, chainId, evidence, pubkey)
+}
+
+// checkDoubleVotingConsumerPhase refuses double-voting evidence for a
+// consumer that has not launched or is deleted, and for one governance
+// removed. Callers run it before reading the consumer's chain id, which
+// deletion releases, so the refusal is the evidence error rather than a
+// missing-state one.
+func (k Keeper) checkDoubleVotingConsumerPhase(ctx sdk.Context, consumerId uint64) error {
+	// The evidence needs a consumer that has launched and still holds its
+	// state: LAUNCHED, PAUSED or STOPPED. A pause or a stop does not void a
+	// double-sign: the punishment it queues is frozen with a pause and keeps
+	// its own clock through a stop (see SweepPendingEquivocationPunishments),
+	// and the evidence is self-contained signatures that need nothing from
+	// the chain to stand. Refusing it off LAUNCHED would hand a validator
+	// whose consumer is paused or stopped before its evidence lands an escape.
+	switch k.GetConsumerPhase(ctx, consumerId) {
+	case types.CONSUMER_PHASE_LAUNCHED, types.CONSUMER_PHASE_PAUSED, types.CONSUMER_PHASE_STOPPED:
+	default:
 		return errorsmod.Wrapf(
 			vaastypes.ErrInvalidDoubleVotingEvidence,
-			"consumer chain %d is not launched",
+			"consumer chain %d has not launched or is deleted",
 			consumerId,
 		)
 	}
+	// A governance removal is the one verdict on a consumer's evidence: it
+	// cancels the pending punishments, and evidence submitted after it would
+	// otherwise queue new ones the verdict can no longer reach (a consumer
+	// that carries the verdict cannot be removed again). A stop by the
+	// liveness sweep or by a lapsed pause is not a verdict and leaves the
+	// evidence acceptable until governance removes the stopped consumer.
+	if k.IsConsumerRemovedByGovernance(ctx, consumerId) {
+		return errorsmod.Wrapf(
+			vaastypes.ErrInvalidDoubleVotingEvidence,
+			"consumer chain %d was removed by governance, which voids its equivocation evidence",
+			consumerId,
+		)
+	}
+	return nil
+}
+
+// HandleConsumerDoubleVotingOver is HandleConsumerDoubleVoting with the chain
+// id the votes are verified over given by the caller: the consumer's current
+// one, or a previous one it carried at the infraction height after a
+// governance rename (EvidenceChainIdFor).
+func (k Keeper) HandleConsumerDoubleVotingOver(
+	ctx sdk.Context,
+	consumerId uint64,
+	chainId string,
+	evidence *tmtypes.DuplicateVoteEvidence,
+	pubkey cryptotypes.PubKey,
+) error {
+	if err := k.checkDoubleVotingConsumerPhase(ctx, consumerId); err != nil {
+		return err
+	}
 
 	// Reject evidence below the per-consumer minimum height (set at launch and
-	// on each resync), which is the ONLY age bound on equivocation. Unlike
+	// restored at genesis), which is the ONLY age bound on equivocation. Unlike
 	// downtime -- which additionally bounds evidence by DowntimeEvidenceMaxAge
 	// (see HandleConsumerDowntime) -- double-signing has no maximum-age bound,
 	// and this asymmetry is intentional:
 	//
 	//   - Equivocation is a permanent, self-contained cryptographic fault: the
 	//     two conflicting signed votes prove it forever, so it is punished
-	//     whenever proven, and exactly once: with tombstoning on, the tombstone
-	//     stops every later submission; with it off, the PunishedEquivocations
-	//     record of the infraction does (see below). Either way there is no
-	//     re-slash risk from stale evidence, and the min-height gate already
-	//     blocks evidence from before the validator was in the consumer's set.
+	//     whenever proven, and exactly once: the PunishedEquivocations record
+	//     of the infraction, written when its punishment is queued, stops
+	//     every later submission, and so does the tombstone once one lands
+	//     (see below). Either way there is no re-slash risk from stale
+	//     evidence, and the min-height gate already blocks evidence from
+	//     before the validator was in the consumer's set.
 	//   - Downtime is a liveness signal priced against a specific epoch and
 	//     resolved through a challenge window; letting arbitrarily old downtime
 	//     evidence in would misprice it and reopen a settled window, so it is
@@ -75,14 +130,8 @@ func (k Keeper) HandleConsumerDoubleVoting(
 		)
 	}
 
-	// get the chainId of this consumer chain to verify the double-voting evidence
-	chainId, err := k.GetConsumerChainId(ctx, consumerId)
-	if err != nil {
-		return err
-	}
-
 	// verifies the double voting evidence using the consumer chain public key
-	if err = k.VerifyDoubleVotingEvidence(*evidence, chainId, pubkey); err != nil {
+	if err := k.VerifyDoubleVotingEvidence(*evidence, chainId, pubkey); err != nil {
 		return err
 	}
 
@@ -113,8 +162,6 @@ func (k Keeper) HandleConsumerDoubleVoting(
 		return nil
 	}
 
-	infractionParams := k.GetInfractionParams(ctx)
-
 	// Queue the punishment instead of executing it: the validator is jailed
 	// now (reversible), while the slash and tombstone wait out
 	// EquivocationExecutionDelay so a removal proposal against the consumer
@@ -126,17 +173,18 @@ func (k Keeper) HandleConsumerDoubleVoting(
 		return err
 	}
 
-	// A tombstoning punishment needs no record: the pending entry stops the
-	// next submission while it waits, the tombstone does once it executes,
-	// and either makes any record left by an earlier, non-tombstoning policy
-	// redundant. A non-tombstoning punishment is remembered now, or the same
-	// evidence would queue again once its entry has resolved.
-	if alreadyTombstoned || infractionParams.DoubleSign.Tombstone {
-		if err := k.PunishedEquivocations.Clear(ctx, collections.NewSuperPrefixedTripleRange[string, []byte, int64](chainId, punishedKey.K2())); err != nil {
-			return fmt.Errorf("forgetting the punished equivocations of a tombstoned validator: %w", err)
+	// The infraction is remembered as soon as its punishment is queued,
+	// whatever the tombstone policy says now: the policy is read again when
+	// the punishment executes (see executePendingEquivocation), and a
+	// governance change in between must not leave the same two votes
+	// punishable a second time. The record goes with the validator's others
+	// once a tombstone lands (see forgetPunishedEquivocationsOf), the
+	// tombstone stopping every later submission by itself, which is also why
+	// a validator already tombstoned needs none.
+	if !alreadyTombstoned {
+		if err := k.PunishedEquivocations.Set(ctx, punishedKey); err != nil {
+			return fmt.Errorf("recording the punished equivocation: %w", err)
 		}
-	} else if err := k.PunishedEquivocations.Set(ctx, punishedKey); err != nil {
-		return fmt.Errorf("recording the punished equivocation: %w", err)
 	}
 
 	k.Logger(ctx).Info(
@@ -250,9 +298,11 @@ func (k Keeper) VerifyDoubleVotingEvidence(
 // forked and no validator's stake: the consumer's IBC client is frozen and
 // the consumer is paused (see containLightClientAttack). A frozen client
 // accepts no packet proven against either branch of the fork, ICS-20 escrow
-// and vouchers included; a paused consumer gets no VSC, both evidence paths
-// close, its pending downtime accusations are cancelled and the fees
-// withheld on their account repaid, and an auto-stop at MaxPauseDuration
+// and vouchers included; a paused consumer gets no VSC, its downtime and
+// misbehaviour paths close (double-voting evidence stays acceptable, see
+// HandleConsumerDoubleVoting), its pending downtime accusations are cancelled
+// and the fees withheld on their account repaid, and an auto-stop at
+// MaxPauseDuration
 // guarantees governance silence converges to STOPPED. This message does both
 // in one transaction, through the client keeper's UpdateClient, and adds the
 // attribution. It is not the only way in: a relayer or watcher reports the
@@ -322,9 +372,10 @@ func (k Keeper) HandleConsumerMisbehaviour(ctx sdk.Context, consumerId uint64, m
 // reported the fork to 02-client first) or expired cannot be updated and
 // needs nothing from here; the resume path insists on an active client
 // either way. Then the pause does the rest. A paused consumer receives no
-// further VSC packets (QueueVSCPackets serves only launched consumers), both
-// evidence paths reject it (HandleConsumerDoubleVoting and this handler gate
-// on launched, closing the pipeline a malicious binary would keep feeding),
+// further VSC packets (QueueVSCPackets serves only launched consumers), its
+// downtime packets and this handler reject it (both gate on launched, closing
+// the pipeline a malicious binary would keep feeding; double-voting evidence
+// is self-contained and stays acceptable, see HandleConsumerDoubleVoting),
 // its pending downtime accusations are cancelled and the fees withheld on
 // their account repaid (a forked chain's accusations are no more trustworthy
 // than its headers; see PauseConsumerChain), and an auto-stop at
@@ -346,7 +397,7 @@ func (k Keeper) containLightClientAttack(
 
 	clientId, found := k.GetConsumerClientId(ctx, consumerId)
 	if !found {
-		return nil, errorsmod.Wrapf(types.ErrInvalidConsumerClient, "no client discovered for consumer %d", consumerId)
+		return nil, errorsmod.Wrapf(types.ErrInvalidConsumerClient, "no client declared for consumer %d", consumerId)
 	}
 	if k.clientKeeper.GetClientStatus(ctx, clientId) == ibcexported.Active {
 		if err := k.clientKeeper.UpdateClient(ctx, clientId, misbehaviour); err != nil {

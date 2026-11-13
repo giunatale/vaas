@@ -7,6 +7,7 @@ option go_package = "github.com/allinbits/vaas/x/vaas/provider/types";
 import "cosmos_proto/cosmos.proto";
 import "gogoproto/gogo.proto";
 import "google/protobuf/timestamp.proto";
+import "ibc/core/client/v1/client.proto";
 import "vaas/v1/shared_consumer.proto";
 import "vaas/v1/wire.proto";
 import "vaas/provider/v1/provider.proto";
@@ -46,9 +47,9 @@ message GenesisState {
   repeated PendingDowntimeSlash pending_downtime_slashes = 9
       [ (gogoproto.nullable) = false ];
 
-  // The downtime params in effect immediately before the last change to
-  // InfractionParams, if any. Absent means the downtime params have never
-  // changed.
+  // The downtime params (the signed blocks window and the minimum signed per
+  // window of Params.infraction_parameters) in effect immediately before they
+  // last changed, if any. Absent means they have never changed.
   PreviousDowntimeParams previous_downtime_params = 10;
 
   // Per-validator fee-share records from each consumer's fee distribution
@@ -137,9 +138,10 @@ message DowntimeWindowFloor {
 
 // PunishedEquivocation is a single (chain_id, provider_cons_addr,
 // infraction_height) entry from the keeper's PunishedEquivocations
-// collection: a consumer double-sign already punished without tombstoning
-// the validator, which the same evidence must not punish again, not even
-// under a consumer that re-registered the chain id.
+// collection: a consumer double-sign whose punishment was queued, which the
+// same evidence must not punish again, not even under a consumer that
+// re-registered the chain id. The entries of a validator are dropped once a
+// tombstone lands on it.
 message PunishedEquivocation {
   string chain_id = 1;
   bytes provider_cons_addr = 2;
@@ -166,6 +168,16 @@ message EpochShareRecord {
   ];
 }
 
+// PreviousChainId is a chain id a consumer carried before a governance
+// rename, with the declared client's height at the rename.
+message PreviousChainId {
+  string chain_id = 1;
+  // boundary is the declared client's latest height at the rename, in the
+  // client's (new) revision: evidence signed over chain_id is accepted for
+  // a block of a lower revision, or of this revision at or below this height.
+  ibc.core.client.v1.Height boundary = 2 [ (gogoproto.nullable) = false ];
+}
+
 // The provider VAAS module's knowledge of consumer state.
 //
 // Note this type is only used internally to the provider VAAS module.
@@ -177,15 +189,13 @@ message ConsumerState {
   string chain_id = 2;
   // ClientID defines the IBC client ID for the consumer chain.
   string client_id = 3;
-  // InitialHeight defines the initial block height for the consumer chain
-  uint64 initial_height = 4;
   // ConsumerGenesis defines the initial consumer chain genesis states
   vaas.v1.ConsumerGenesisState consumer_genesis = 5
       [ (gogoproto.nullable) = false ];
   // PendingValsetChanges defines the pending validator set changes for the
   // consumer chain
-  repeated vaas.v1.ValidatorSetChangePacketData pending_valset_changes = 6 [ (gogoproto.nullable) = false ];
-  repeated string slash_downtime_ack = 7;
+  repeated vaas.v1.ValidatorSetChangePacketData pending_valset_changes = 6
+      [ (gogoproto.nullable) = false ];
   // the phase of the consumer chain
   ConsumerPhase phase = 8;
   // OwnerAddress is the bech32 address that authorises owner-only operations
@@ -205,8 +215,7 @@ message ConsumerState {
   // RemovalTime is the wall-clock time at which a STOPPED consumer is
   // scheduled to transition to DELETED. Set only when phase == STOPPED;
   // absent otherwise. Used to re-derive the keeper's removal-time queue.
-  google.protobuf.Timestamp removal_time = 12
-      [ (gogoproto.stdtime) = true ];
+  google.protobuf.Timestamp removal_time = 12 [ (gogoproto.stdtime) = true ];
 
   // Liveness clock, present once a consumer has launched: LastAckTime is the
   // block time of the consumer's most recent successful VSC acknowledgement
@@ -214,8 +223,7 @@ message ConsumerState {
   // HighestAckedVscId are the resync counters that decide whether the consumer
   // is behind. Round-tripped so a state-export restart preserves the grace
   // window and resync state instead of resetting them.
-  google.protobuf.Timestamp last_ack_time = 13
-      [ (gogoproto.stdtime) = true ];
+  google.protobuf.Timestamp last_ack_time = 13 [ (gogoproto.stdtime) = true ];
   uint64 highest_sent_vsc_id = 14;
   uint64 highest_acked_vsc_id = 15;
 
@@ -239,10 +247,46 @@ message ConsumerState {
   // other phase.
   PauseReason pause_reason = 18;
   // paused_at is when a PAUSED consumer was paused; absent in every other
-  // phase. A resume after a light-client pause waits one client trusting
+  // phase. It stays the start of the pause when the pause is moved under
+  // another reason.
+  google.protobuf.Timestamp paused_at = 19 [ (gogoproto.stdtime) = true ];
+  // removed_by_governance records that governance removed the consumer (a
+  // MsgRemoveConsumer stopped it, or its removal vote passed after it had
+  // stopped), the verdict that voids its equivocation evidence. Only a
+  // stopped consumer carries it.
+  bool removed_by_governance = 20;
+
+  // validator_set is the consumer's validator set as the provider last sent
+  // it (the ConsumerValidators collection). It is exported so a restarted
+  // provider serves and judges evidence from its first block: an empty set
+  // would refuse every accused validator as not in the set until the next
+  // epoch boundary rebuilt it.
+  repeated ConsensusValidator validator_set = 22
+      [ (gogoproto.nullable) = false ];
+
+  // previous_chain_ids lists the chain ids the consumer carried before
+  // governance renames, each with the declared client's height at the
+  // rename, at or below which (in the client's revision) double-voting
+  // evidence signed over the old id is still accepted. They stay reserved:
+  // no other consumer may register them until this one is deleted.
+  repeated PreviousChainId previous_chain_ids = 21
+      [ (gogoproto.nullable) = false ];
+
+  // fork_known_at is when the provider learned that a consumer paused for a
+  // light-client attack forked: its paused_at when it was paused for the
+  // attack, or the block its client was found frozen at when it was paused
+  // for another reason first. Present only while the pause reason is
+  // PAUSE_REASON_LIGHT_CLIENT_ATTACK. A resume waits one client trusting
   // period from it, so the fork's evidence can no longer pause the consumer.
-  google.protobuf.Timestamp paused_at = 19
+  google.protobuf.Timestamp fork_known_at = 23
       [ (gogoproto.stdtime) = true ];
+
+  // client_recovered_since_fork is set while a consumer paused for a
+  // light-client attack has had its client seen Active after fork_known_at:
+  // a recovery landed during the pause. The next time the client is seen
+  // Frozen, fork_known_at moves to that block and the mark is cleared (see
+  // PauseConsumersWithFrozenClients). False in every other case.
+  bool client_recovered_since_fork = 24;
 }
 
 // ConsumerFeesPerBlockOverride is a single per-consumer override entry for
@@ -250,7 +294,7 @@ message ConsumerState {
 message ConsumerFeesPerBlockOverride {
   uint64 consumer_id = 1;
   // amount is a non-negative math.Int in string form.
-  string amount = 2 [(cosmos_proto.scalar) = "cosmos.Int"];
+  string amount = 2 [ (cosmos_proto.scalar) = "cosmos.Int" ];
 }
 
 // ConsumerFeePoolShare is a single depositor's share holding in a consumer
@@ -258,7 +302,7 @@ message ConsumerFeesPerBlockOverride {
 // is unique.
 message ConsumerFeePoolShare {
   uint64 consumer_id = 1;
-  string depositor = 2 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  string depositor = 2 [ (cosmos_proto.scalar) = "cosmos.AddressString" ];
   string denom = 3;
   string shares = 4 [
     (cosmos_proto.scalar) = "cosmos.Int",
@@ -272,7 +316,8 @@ message ConsumerFeePoolShare {
 message ConsumerRefusal {
   uint64 consumer_id = 1;
   // the refusing validator's operator address
-  string validator_address = 2 [(cosmos_proto.scalar) = "cosmos.ValidatorAddressString"];
+  string validator_address = 2
+      [ (cosmos_proto.scalar) = "cosmos.ValidatorAddressString" ];
 }
 
 // HeldUnbondingOps lists the staking unbonding-operation ids held for one

@@ -51,7 +51,7 @@ func (k msgServer) UpdateParams(goCtx context.Context, msg *types.MsgUpdateParam
 	// challengeable interval against the trusting period fraction, say).
 	current := k.GetParams(ctx)
 	merged := msg.ApplyTo(current)
-	if err := merged.Validate(); err != nil {
+	if err := k.ValidateParams(merged); err != nil {
 		return nil, errorsmod.Wrap(sdkerrors.ErrInvalidRequest, err.Error())
 	}
 
@@ -158,19 +158,16 @@ func (k msgServer) SubmitConsumerMisbehaviour(goCtx context.Context, msg *types.
 func (k msgServer) SubmitConsumerDoubleVoting(goCtx context.Context, msg *types.MsgSubmitConsumerDoubleVoting) (*types.MsgSubmitConsumerDoubleVotingResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
 
-	consumerChainId, err := k.GetConsumerChainId(ctx, msg.ConsumerId)
-	if err != nil {
+	if err := k.checkDoubleVotingConsumerPhase(ctx, msg.ConsumerId); err != nil {
 		return nil, err
 	}
-	headerChainID := msg.InfractionBlockHeader.SignedHeader.Header.ChainID
-	if headerChainID != consumerChainId {
-		return nil, errorsmod.Wrapf(
-			vaastypes.ErrInvalidDoubleVotingEvidence,
-			"infraction block header chain id (%s) does not match consumer chain id (%s) (consumerId: %d)",
-			headerChainID,
-			consumerChainId,
-			msg.ConsumerId,
-		)
+	// The consumer's chain id, or one it carried before a governance rename
+	// for a block at or below the rename (EvidenceChainIdFor): the votes are
+	// verified over it.
+	chainId, err := k.EvidenceChainIdFor(ctx, msg.ConsumerId,
+		msg.InfractionBlockHeader.SignedHeader.Header.ChainID, msg.InfractionBlockHeader.SignedHeader.Header.Height)
+	if err != nil {
+		return nil, err
 	}
 
 	evidence, err := tmtypes.DuplicateVoteEvidenceFromProto(msg.DuplicateVoteEvidence)
@@ -203,7 +200,7 @@ func (k msgServer) SubmitConsumerDoubleVoting(goCtx context.Context, msg *types.
 
 	// handle the double voting evidence using the malicious validator's public key
 	consumerId := msg.ConsumerId
-	if err := k.Keeper.HandleConsumerDoubleVoting(ctx, consumerId, evidence, pubkey); err != nil {
+	if err := k.Keeper.HandleConsumerDoubleVotingOver(ctx, consumerId, chainId, evidence, pubkey); err != nil {
 		return nil, err
 	}
 
@@ -212,7 +209,7 @@ func (k msgServer) SubmitConsumerDoubleVoting(goCtx context.Context, msg *types.
 			vaastypes.EventTypeSubmitConsumerDoubleVoting,
 			sdk.NewAttribute(sdk.AttributeKeyModule, types.ModuleName),
 			sdk.NewAttribute(types.AttributeConsumerId, strconv.FormatUint(msg.ConsumerId, 10)),
-			sdk.NewAttribute(types.AttributeConsumerChainId, consumerChainId),
+			sdk.NewAttribute(types.AttributeConsumerChainId, chainId),
 			sdk.NewAttribute(vaastypes.AttributeConsumerDoubleVoting, msg.DuplicateVoteEvidence.String()),
 			sdk.NewAttribute(types.AttributeSubmitterAddress, msg.Submitter),
 		),
@@ -221,18 +218,19 @@ func (k msgServer) SubmitConsumerDoubleVoting(goCtx context.Context, msg *types.
 	return &types.MsgSubmitConsumerDoubleVotingResponse{}, nil
 }
 
-// validateConsumerInitParams enforces the two bounds on a consumer's
+// validateConsumerInitParams enforces the bounds on a consumer's
 // initialization parameters that can only be checked against provider state
 // (positivity and format are already checked by ValidateInitializationParameters).
-// Both are cross-chain settings the provider holds at create/update time, so it
+// They are cross-chain settings the provider holds at create/update time, so it
 // can validate them here against its own state -- it reads its unbonding once
 // and derives the grace from it:
 //
 //   - UnbondingPeriod must not exceed the provider's unbonding, so the consumer
-//     cannot outlive the provider's slashable window. No lower floor is imposed:
-//     an unbonding short enough to make the relayer-derived trusting period
-//     impractical is an operator concern (and useful for test/dev chains), not
-//     a protocol minimum.
+//     cannot outlive the provider's slashable window.
+//   - UnbondingPeriod * TrustingPeriodFraction must exceed the downtime
+//     challenge horizon (DowntimeEvidenceMaxAge + DowntimeChallengeWindow), or
+//     no client of the consumer could ever be declared (see SetConsumerClient).
+//     With the defaults that is an unbonding period above about 15.2 days.
 //   - SafeModeThreshold must be strictly shorter than the provider's liveness
 //     grace (unbonding * LivenessGraceFraction), so a lagging consumer enters
 //     safe mode -- and stops value-bearing work under a possibly-stale set --
@@ -246,16 +244,21 @@ func (k Keeper) validateConsumerInitParams(ctx sdk.Context, p types.ConsumerInit
 		return errorsmod.Wrapf(types.ErrInvalidConsumerInitializationParameters,
 			"unbonding period %s must not exceed provider unbonding %s", p.UnbondingPeriod, providerUnbonding)
 	}
-	// A light client's trusting period must sit below its chain's unbonding
-	// period, and the declared consumer client's trusting period must exceed
-	// the downtime challenge horizon (see SetConsumerClient) so accepted
-	// accusations stay disprovable. An unbonding period at or below the
-	// horizon therefore admits no valid client at all: reject the consumer at
-	// registration instead of letting every later declaration fail.
-	if horizon := k.GetInfractionParams(ctx).ChallengeableInterval(); p.UnbondingPeriod <= horizon {
+	// A light client's trusting period is a fraction of its chain's unbonding
+	// period (TrustingPeriodFraction here, two thirds for the relayers), and
+	// the declared consumer client's trusting period must exceed the downtime
+	// challenge horizon (see SetConsumerClient) so accepted accusations stay
+	// disprovable. An unbonding period whose trusting period at that fraction
+	// does not clear the horizon admits no declarable client: reject the
+	// consumer at registration instead of letting every later declaration fail.
+	trusting, err := vaastypes.CalculateTrustPeriod(p.UnbondingPeriod, k.GetParams(ctx).TrustingPeriodFraction)
+	if err != nil {
+		return err
+	}
+	if horizon := k.GetInfractionParams(ctx).ChallengeableInterval(); trusting <= horizon {
 		return errorsmod.Wrapf(types.ErrInvalidConsumerInitializationParameters,
-			"unbonding period %s must exceed the downtime challenge horizon %s (evidence max age + challenge window): no IBC client of this consumer could otherwise keep challenge headers verifiable",
-			p.UnbondingPeriod, horizon)
+			"unbonding period %s gives a client trusting period of %s at fraction %s, which must exceed the downtime challenge horizon %s (evidence max age + challenge window): no IBC client of this consumer could otherwise keep challenge headers verifiable",
+			p.UnbondingPeriod, trusting, k.GetParams(ctx).TrustingPeriodFraction, horizon)
 	}
 	grace, err := vaastypes.CalculateTrustPeriod(providerUnbonding, k.GetParams(ctx).LivenessGraceFraction)
 	if err != nil {
@@ -275,6 +278,12 @@ func (k msgServer) CreateConsumer(goCtx context.Context, msg *types.MsgCreateCon
 
 	// initialize an empty slice to store event attributes
 	eventAttributes := []sdk.Attribute{}
+
+	// The registration fee comes first: a submitter who cannot pay it creates
+	// nothing, not even a consumer id.
+	if err := k.Keeper.ChargeConsumerRegistrationFee(ctx, msg.Submitter); err != nil {
+		return nil, err
+	}
 
 	consumerId := k.Keeper.FetchAndIncrementConsumerId(ctx)
 
@@ -377,18 +386,32 @@ func (k msgServer) UpdateConsumer(goCtx context.Context, msg *types.MsgUpdateCon
 
 	consumerId := msg.ConsumerId
 
-	// The updatable phases are named here instead of asking IsConsumerActive,
-	// which counts a paused consumer as active. Paused is deliberately
-	// excluded: an update can rewrite the infraction parameters and
-	// initialization parameters that the challenge which caused the pause was
-	// judged under, and the resume path replays state built from them.
-	// Governance resumes or removes the consumer first, then updates it.
-	updatePhase := k.Keeper.GetConsumerPhase(ctx, consumerId)
-	if updatePhase != types.CONSUMER_PHASE_REGISTERED &&
-		updatePhase != types.CONSUMER_PHASE_INITIALIZED &&
-		updatePhase != types.CONSUMER_PHASE_LAUNCHED {
+	// The governance authority may update a consumer too: it is the one
+	// signer that may rename a consumer that has launched, to the chain id
+	// its declared client tracks (RenameLaunchedConsumer).
+	isGov := msg.Owner == k.GetAuthority()
+
+	// The updatable phases are named here instead of asking IsConsumerActive.
+	// A paused consumer is updatable like a launched one: its metadata, its
+	// ownership and its client declaration change, its initialization
+	// parameters are frozen (checked below), and only the governance
+	// authority renames it. A stopped consumer admits the governance
+	// authority alone, for that rename: a mismatch pause that outlived
+	// MaxPauseDuration stops the consumer with its record still naming the
+	// old chain id, and the chain id of a stopped consumer serves the
+	// verification of its evidence and nothing else until its deletion. A
+	// deleted consumer admits nothing.
+	switch k.Keeper.GetConsumerPhase(ctx, consumerId) {
+	case types.CONSUMER_PHASE_REGISTERED, types.CONSUMER_PHASE_INITIALIZED,
+		types.CONSUMER_PHASE_LAUNCHED, types.CONSUMER_PHASE_PAUSED:
+	case types.CONSUMER_PHASE_STOPPED:
+		if !isGov {
+			return &resp, errorsmod.Wrapf(types.ErrUnauthorized,
+				"only the governance authority updates a stopped consumer, to rename it to the chain id its declared client tracks: %d", consumerId)
+		}
+	default:
 		return &resp, errorsmod.Wrapf(types.ErrInvalidPhase,
-			"cannot update consumer chain that is not in the registered, initialized, or launched phase: %d", consumerId)
+			"cannot update consumer chain that is not in the registered, initialized, launched, paused or stopped phase: %d", consumerId)
 	}
 
 	ownerAddress, err := k.Keeper.GetConsumerOwnerAddress(ctx, consumerId)
@@ -396,8 +419,8 @@ func (k msgServer) UpdateConsumer(goCtx context.Context, msg *types.MsgUpdateCon
 		return &resp, errorsmod.Wrapf(types.ErrNoOwnerAddress, "cannot retrieve owner address %s", ownerAddress)
 	}
 
-	if msg.Owner != ownerAddress {
-		return &resp, errorsmod.Wrapf(types.ErrUnauthorized, "expected owner address %s, got %s", ownerAddress, msg.Owner)
+	if msg.Owner != ownerAddress && !isGov {
+		return &resp, errorsmod.Wrapf(types.ErrUnauthorized, "expected owner address %s or the governance authority, got %s", ownerAddress, msg.Owner)
 	}
 
 	// The optional client declaration: the owner names the IBC client the
@@ -415,19 +438,14 @@ func (k msgServer) UpdateConsumer(goCtx context.Context, msg *types.MsgUpdateCon
 		return &resp, errorsmod.Wrapf(vaastypes.ErrInvalidConsumerState, "cannot get consumer chain ID: %s", err.Error())
 	}
 
-	isLaunched := k.GetConsumerPhase(ctx, consumerId) == types.CONSUMER_PHASE_LAUNCHED
+	postLaunch := !k.IsConsumerPrelaunched(ctx, consumerId)
 
-	// When the chain is already launched, the owner can only update metadata and transfer ownership.
-	// Chain-id and initialization parameters are restricted to pre-launch phases.
-	if isLaunched {
-		if strings.TrimSpace(msg.NewChainId) != "" {
-			return &resp, errorsmod.Wrapf(types.ErrInvalidPhase,
-				"cannot update chain id of a launched chain")
-		}
-		if msg.InitializationParameters != nil {
-			return &resp, errorsmod.Wrapf(types.ErrInvalidPhase,
-				"cannot update initialization parameters of a launched chain")
-		}
+	// After launch (launched or paused) the owner updates metadata and
+	// transfers ownership; initialization parameters are frozen, and the
+	// chain id follows the declared client only, by governance.
+	if postLaunch && msg.InitializationParameters != nil {
+		return &resp, errorsmod.Wrapf(types.ErrInvalidPhase,
+			"cannot update initialization parameters of a chain that has launched")
 	}
 
 	// We only validate and use `NewChainId` if it is not empty (because `NewChainId` is an optional argument)
@@ -437,15 +455,29 @@ func (k msgServer) UpdateConsumer(goCtx context.Context, msg *types.MsgUpdateCon
 			return &resp, errorsmod.Wrapf(types.ErrInvalidMsgUpdateConsumer, "invalid new chain id: %s", err.Error())
 		}
 
-		if k.IsConsumerPrelaunched(ctx, consumerId) {
+		switch {
+		case !postLaunch:
+			// A declared client tracks a chain id; a rename after the
+			// declaration would leave the two apart (see
+			// consumerClientChainIdMismatch), so the rename comes first.
+			if declared, found := k.GetConsumerClientId(ctx, consumerId); found && declared != "" {
+				return &resp, errorsmod.Wrapf(types.ErrInvalidMsgUpdateConsumer,
+					"cannot rename consumer %d after its client %s was declared; the client tracks the chain id", consumerId, declared)
+			}
 			chainId = msg.NewChainId
 			if err := k.Keeper.ValidateConsumerChainIdFree(ctx, chainId); err != nil {
 				return nil, err
 			}
 			k.SetConsumerChainId(ctx, consumerId, chainId)
-		} else {
-			// the chain id cannot be updated if the chain is NOT in a prelaunched (i.e., registered or initialized) phase
-			return &resp, errorsmod.Wrapf(types.ErrInvalidPhase, "cannot update chain id of a non-prelaunched chain: %s", k.GetConsumerPhase(ctx, consumerId))
+		case isGov:
+			if err := k.Keeper.RenameLaunchedConsumer(ctx, consumerId, msg.NewChainId); err != nil {
+				return &resp, err
+			}
+			eventAttributes = append(eventAttributes, sdk.NewAttribute(types.AttributePreviousChainId, chainId))
+			chainId = msg.NewChainId
+		default:
+			return &resp, errorsmod.Wrapf(types.ErrUnauthorized,
+				"only the governance authority renames a consumer that has launched, to the chain id its declared client tracks")
 		}
 	}
 
@@ -579,6 +611,13 @@ func (k msgServer) UpdateConsumer(goCtx context.Context, msg *types.MsgUpdateCon
 // A launched or paused consumer is stopped and prepared for a removal that
 // erases state only once the unbonding period has elapsed; real validators
 // are running such a chain, so ending it is governance's call alone.
+//
+// A consumer already stopped for another reason (the liveness sweep, a
+// lapsed pause) can still be removed by governance: the phase and the
+// scheduled deletion stay as they are, and the removal is recorded as the
+// verdict on the consumer's equivocation evidence, cancelling its pending
+// punishments and refusing evidence submitted afterwards. A consumer that
+// already carries the verdict cannot be removed again.
 func (k msgServer) RemoveConsumer(goCtx context.Context, msg *types.MsgRemoveConsumer) (*types.MsgRemoveConsumerResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
 	resp := types.MsgRemoveConsumerResponse{}
@@ -640,15 +679,37 @@ func (k msgServer) RemoveConsumer(goCtx context.Context, msg *types.MsgRemoveCon
 		// cancels them; a consumer stopped for liveness or a lapsed pause is
 		// not a verdict on its evidence (see SweepPendingEquivocationPunishments).
 		k.CancelPendingEquivocationPunishmentsForConsumer(ctx, consumerId)
+		k.MarkConsumerRemovedByGovernance(ctx, consumerId)
 		k.Logger(ctx).Info("stopped consumer",
 			"consumerId", consumerId,
 			"chainId", chainId,
 			"phase", phase,
 		)
 
+	case phase == types.CONSUMER_PHASE_STOPPED:
+		if !isGov {
+			return nil, errorsmod.Wrapf(govtypes.ErrInvalidSigner,
+				"invalid authority; a stopped consumer is removed only by the governance authority %s, got %s",
+				k.GetAuthority(), msg.Signer)
+		}
+		if k.IsConsumerRemovedByGovernance(ctx, consumerId) {
+			return &resp, errorsmod.Wrapf(types.ErrInvalidPhase,
+				"consumer %d is stopped and already removed by governance", consumerId)
+		}
+		// Stopped for another reason, so its deletion is already scheduled
+		// and stays as it is. The removal is still the verdict on the
+		// consumer's evidence: the same cancellation as above, and the
+		// record that refuses evidence submitted afterwards.
+		k.CancelPendingEquivocationPunishmentsForConsumer(ctx, consumerId)
+		k.MarkConsumerRemovedByGovernance(ctx, consumerId)
+		k.Logger(ctx).Info("recorded the governance removal of a stopped consumer",
+			"consumerId", consumerId,
+			"chainId", chainId,
+		)
+
 	default:
 		return &resp, errorsmod.Wrapf(types.ErrInvalidPhase,
-			"consumer %d is %s; a stopped or deleted consumer cannot be removed again", consumerId, phase)
+			"consumer %d is %s; a deleted consumer cannot be removed again", consumerId, phase)
 	}
 
 	ctx.EventManager().EmitEvent(
@@ -657,9 +718,10 @@ func (k msgServer) RemoveConsumer(goCtx context.Context, msg *types.MsgRemoveCon
 			sdk.NewAttribute(sdk.AttributeKeyModule, types.ModuleName),
 			sdk.NewAttribute(types.AttributeConsumerId, strconv.FormatUint(consumerId, 10)),
 			sdk.NewAttribute(types.AttributeConsumerChainId, chainId),
-			// The phase at removal tells the two arms apart for indexers: a
+			// The phase at removal tells the arms apart for indexers: a
 			// pre-launch phase means immediate erasure, launched or paused a
-			// deferred one.
+			// deferred one, stopped a verdict on a consumer whose deletion
+			// was already scheduled.
 			sdk.NewAttribute(types.AttributeConsumerPhase, phase.String()),
 			sdk.NewAttribute(types.AttributeSubmitterAddress, msg.Signer),
 		),
@@ -712,6 +774,11 @@ func (k msgServer) SetConsumerFeesPerBlock(
 				"fees-per-block override (%s) must be greater than the global fees_per_block (%s)",
 				amt, defaultAmt,
 			)
+		}
+		// The override is multiplied by blocks_per_epoch at every epoch boundary
+		// exactly as the default is, so it is held to the same bound.
+		if err := types.ValidateFeesPerEpoch(amt, k.GetBlocksPerEpoch(ctx)); err != nil {
+			return nil, errorsmod.Wrap(sdkerrors.ErrInvalidRequest, err.Error())
 		}
 		if err := k.ConsumerFeesPerBlockOverride.Set(ctx, msg.ConsumerId, amt); err != nil {
 			return nil, err
@@ -822,7 +889,7 @@ func (k msgServer) FundConsumerFeePool(
 // WithdrawConsumerFeePool burns the depositor's shares across one or more
 // denoms and returns the corresponding tokens. The handler is all-or-nothing
 // at the tx boundary: a mid-flight failure on any denom returns an error and
-// the SDK rolls back the entire tx.
+// cosmos-sdk's BaseApp rolls back the entire tx.
 //
 // When the signer is the gov authority, the depositor identity is the
 // distribution module account and the tokens are routed back to the community

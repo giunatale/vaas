@@ -9,6 +9,7 @@ import (
 
 	tmprotocrypto "github.com/cometbft/cometbft/proto/tendermint/crypto"
 
+	clienttypes "github.com/cosmos/ibc-go/v10/modules/core/02-client/types"
 	ibchost "github.com/cosmos/ibc-go/v10/modules/core/exported"
 	ibctmtypes "github.com/cosmos/ibc-go/v10/modules/light-clients/07-tendermint"
 
@@ -62,18 +63,24 @@ type Keeper struct {
 	Schema collections.Schema
 
 	// State collections
-	Params                        collections.Item[types.Params]
-	ValidatorSetUpdateId          collections.Sequence
-	ConsumerId                    collections.Sequence
-	ConsumerClients               *collections.IndexedMap[uint64, string, ConsumerClientIndexes]
-	ConsumerGenesis               collections.Map[uint64, vaastypes.ConsumerGenesisState]
-	InitChainHeight               collections.Map[uint64, uint64]
-	PendingVSCPackets             collections.Map[uint64, types.ValidatorSetChangePackets]
-	ConsumerChainId               collections.Map[uint64, string]
-	ConsumerOwnerAddress          collections.Map[uint64, string]
-	ConsumerMetadata              collections.Map[uint64, types.ConsumerMetadata]
-	ConsumerInitParams            collections.Map[uint64, types.ConsumerInitializationParameters]
-	ConsumerPhase                 collections.Map[uint64, uint32]
+	Params               collections.Item[types.Params]
+	ValidatorSetUpdateId collections.Sequence
+	ConsumerId           collections.Sequence
+	ConsumerClients      *collections.IndexedMap[uint64, string, ConsumerClientIndexes]
+	ConsumerGenesis      collections.Map[uint64, vaastypes.ConsumerGenesisState]
+	PendingVSCPackets    collections.Map[uint64, types.ValidatorSetChangePackets]
+	ConsumerChainId      collections.Map[uint64, string]
+	ConsumerOwnerAddress collections.Map[uint64, string]
+	ConsumerMetadata     collections.Map[uint64, types.ConsumerMetadata]
+	ConsumerInitParams   collections.Map[uint64, types.ConsumerInitializationParameters]
+	ConsumerPhase        collections.Map[uint64, uint32]
+	// LiveConsumerIds is the set of consumer ids whose phase is not DELETED:
+	// the ids the per-block sweeps, the epoch paths and the key-assignment
+	// collision checks walk, so a deleted consumer costs them nothing.
+	// SetConsumerPhase maintains it, which covers creation, deletion and the
+	// genesis import alike; it is derived from ConsumerPhase and not exported
+	// (ExportGenesis walks every id ever created, deleted ones included).
+	LiveConsumerIds               collections.KeySet[uint64]
 	ConsumerDebt                  collections.Map[uint64, bool]
 	ConsumerFeesPerBlockOverride  collections.Map[uint64, math.Int]
 	EquivocationEvidenceMinHeight collections.Map[uint64, uint64]
@@ -97,10 +104,24 @@ type Keeper struct {
 	// paused for: set by PauseConsumerChain, cleared when the consumer leaves
 	// PAUSED (ResumeConsumerChain, StopAndPrepareForConsumerRemoval).
 	ConsumerPauseReason collections.Map[uint64, int32]
-	// ConsumerPausedAt keeps, per paused consumer, the block time it was paused
-	// at; a resume after a light-client pause waits one client trusting period
-	// from it (see ResumeConsumerChain). Cleared with the pause reason.
+	// ConsumerPausedAt keeps, per paused consumer, the block time its pause
+	// began at, kept when the pause is moved under another reason (see
+	// escalatePauseToLightClientAttack). Cleared with the pause reason.
 	ConsumerPausedAt collections.Map[uint64, []byte]
+	// ConsumerForkKnownAt keeps, per consumer paused for a light-client
+	// attack, the block time the provider learned of the fork: the pause time
+	// of a light-client pause, or the block a pause for another reason was
+	// moved under the light-client reason at. A resume waits one client
+	// trusting period from it (see ResumeConsumerChain). Cleared with the
+	// pause reason.
+	ConsumerForkKnownAt collections.Map[uint64, []byte]
+	// ConsumerClientRecoveredSinceFork marks a consumer paused for a
+	// light-client attack whose client has been seen Active since the fork
+	// became known: a recovery landed during the pause. The next time the
+	// BeginBlock mirror sees that client Frozen, the fork is recorded as
+	// known from that block and the mark is cleared (see
+	// trackForkDuringLightClientPause). Cleared with the pause reason.
+	ConsumerClientRecoveredSinceFork collections.KeySet[uint64]
 
 	// Key assignment collections
 	ValidatorConsumerPubKey collections.Map[collections.Pair[uint64, []byte], []byte]
@@ -173,16 +194,18 @@ type Keeper struct {
 	DowntimeWindowFloors collections.Map[collections.Pair[uint64, []byte], int64]
 
 	// PunishedEquivocations records, per (chain id, live provider cons addr,
-	// infraction height), a consumer double-sign already punished without
-	// tombstoning the validator, so the same infraction is never punished
-	// twice. Keyed by the chain id rather than the consumer id, and kept when
-	// the consumer is deleted, because the evidence is signed over the chain
-	// id: a consumer that re-registers the id could otherwise be handed the
-	// dead chain's double-signs and punish them again. A tombstoning
-	// punishment needs no record, the tombstone stops every later submission
-	// by itself, and drops the validator's entries as redundant. Keyed by the
-	// live address, so a rotation moves the entries (see
-	// migratePunishedEquivocations).
+	// infraction height), a consumer double-sign whose punishment was
+	// queued, so the same infraction is never punished twice. The record is
+	// written whatever the tombstone policy says at the time: the policy is
+	// read again when the punishment executes, and the record is what holds
+	// when the two disagree. Keyed by the chain id rather than the consumer
+	// id, and kept when the consumer is deleted, because the evidence is
+	// signed over the chain id: a consumer that re-registers the id could
+	// otherwise be handed the dead chain's double-signs and punish them
+	// again. A tombstone stops every later submission by itself, so the
+	// records of a validator it lands on are dropped as redundant (see
+	// forgetPunishedEquivocationsOf). Keyed by the live address, so a
+	// rotation moves the entries (see migratePunishedEquivocations).
 	PunishedEquivocations collections.KeySet[collections.Triple[string, []byte, int64]]
 
 	// WithheldFeeRecords holds fee shares withheld from a validator due to a
@@ -209,6 +232,17 @@ type Keeper struct {
 	// accused validator while it has pending equivocation punishments, keyed
 	// (provider consensus address, unbonding op id).
 	HeldUnbondingOps collections.KeySet[collections.Pair[[]byte, uint64]]
+	// ConsumersRemovedByGovernance holds the consumers a governance removal
+	// stopped, or whose removal vote passed after they had stopped: the one
+	// verdict that voids their equivocation evidence, past and future (see
+	// HandleConsumerDoubleVoting). Cleared with the consumer's state.
+	ConsumersRemovedByGovernance collections.KeySet[uint64]
+
+	// ConsumerPreviousChainIds maps (consumer id, a chain id the consumer
+	// carried before a governance rename) to the declared client's height
+	// at the rename: double-voting evidence from a block at or below it may
+	// still be signed over the old id (see SubmitConsumerDoubleVoting).
+	ConsumerPreviousChainIds collections.Map[collections.Pair[uint64, string], clienttypes.Height]
 
 	// PendingEquivocationJails records, per accused validator (provider
 	// consensus address), the jail end this module last set on account of
@@ -302,13 +336,13 @@ func NewKeeper(
 			},
 		),
 		ConsumerGenesis:                  collections.NewMap(sb, types.ConsumerGenesisPrefix, "consumer_genesis", collections.Uint64Key, codec.CollValue[vaastypes.ConsumerGenesisState](cdc)),
-		InitChainHeight:                  collections.NewMap(sb, types.InitChainHeightPrefix, "init_chain_height", collections.Uint64Key, collections.Uint64Value),
 		PendingVSCPackets:                collections.NewMap(sb, types.PendingVSCsPrefix, "pending_vsc_packets", collections.Uint64Key, codec.CollValue[types.ValidatorSetChangePackets](cdc)),
 		ConsumerChainId:                  collections.NewMap(sb, types.ConsumerIdToChainIdPrefix, "consumer_chain_id", collections.Uint64Key, collections.StringValue),
 		ConsumerOwnerAddress:             collections.NewMap(sb, types.ConsumerIdToOwnerAddressPrefix, "consumer_owner_address", collections.Uint64Key, collections.StringValue),
 		ConsumerMetadata:                 collections.NewMap(sb, types.ConsumerIdToMetadataPrefix, "consumer_metadata", collections.Uint64Key, codec.CollValue[types.ConsumerMetadata](cdc)),
 		ConsumerInitParams:               collections.NewMap(sb, types.ConsumerIdToInitializationParamsPrefix, "consumer_init_params", collections.Uint64Key, codec.CollValue[types.ConsumerInitializationParameters](cdc)),
 		ConsumerPhase:                    collections.NewMap(sb, types.ConsumerIdToPhasePrefix, "consumer_phase", collections.Uint64Key, collections.Uint32Value),
+		LiveConsumerIds:                  collections.NewKeySet(sb, types.LiveConsumerIdsPrefix, "live_consumer_ids", collections.Uint64Key),
 		ConsumerDebt:                     collections.NewMap(sb, types.ConsumerIdToDebtPrefix, "consumer_debt", collections.Uint64Key, collections.BoolValue),
 		ConsumerFeesPerBlockOverride:     collections.NewMap(sb, types.ConsumerIdToFeesPerBlockOverridePrefix, "consumer_fees_per_block_override", collections.Uint64Key, sdk.IntValue),
 		EquivocationEvidenceMinHeight:    collections.NewMap(sb, types.EquivocationEvidenceMinHeightPrefix, "equivocation_evidence_min_height", collections.Uint64Key, collections.Uint64Value),
@@ -322,6 +356,8 @@ func NewKeeper(
 		PauseExpirationTimeToConsumerIds: collections.NewMap(sb, types.PauseExpirationTimeToConsumerIdsPrefix, "pause_expiration_time_to_consumer_ids", collections.BytesKey, codec.CollValue[types.ConsumerIds](cdc)),
 		ConsumerPauseReason:              collections.NewMap(sb, types.ConsumerPauseReasonPrefix, "consumer_pause_reason", collections.Uint64Key, collections.Int32Value),
 		ConsumerPausedAt:                 collections.NewMap(sb, types.ConsumerPausedAtPrefix, "consumer_paused_at", collections.Uint64Key, collections.BytesValue),
+		ConsumerForkKnownAt:              collections.NewMap(sb, types.ConsumerForkKnownAtPrefix, "consumer_fork_known_at", collections.Uint64Key, collections.BytesValue),
+		ConsumerClientRecoveredSinceFork: collections.NewKeySet(sb, types.ConsumerClientRecoveredSinceForkPrefix, "consumer_client_recovered_since_fork", collections.Uint64Key),
 
 		// Key assignment collections
 		ValidatorConsumerPubKey: collections.NewMap(sb, types.ConsumerValidatorsPrefix, "validator_consumer_pub_key", collections.PairKeyCodec(collections.Uint64Key, collections.BytesKey), collections.BytesValue),
@@ -417,6 +453,19 @@ func NewKeeper(
 		sb, types.HeldUnbondingOpsPrefix,
 		"held_unbonding_ops",
 		collections.PairKeyCodec(collections.BytesKey, collections.Uint64Key),
+	)
+
+	k.ConsumersRemovedByGovernance = collections.NewKeySet(
+		sb, types.ConsumersRemovedByGovernancePrefix,
+		"consumers_removed_by_governance",
+		collections.Uint64Key,
+	)
+
+	k.ConsumerPreviousChainIds = collections.NewMap(
+		sb, types.ConsumerPreviousChainIdsPrefix,
+		"consumer_previous_chain_ids",
+		collections.PairKeyCodec(collections.Uint64Key, collections.StringKey),
+		codec.CollValue[clienttypes.Height](cdc),
 	)
 
 	k.PendingEquivocationJails = collections.NewMap(
@@ -520,29 +569,6 @@ func (k Keeper) GetValidatorSetUpdateId(ctx context.Context) (validatorSetUpdate
 	return val
 }
 
-// SetInitChainHeight sets the provider block height when the given consumer chain was initiated
-func (k Keeper) SetInitChainHeight(ctx context.Context, consumerId uint64, height uint64) {
-	if err := k.InitChainHeight.Set(ctx, consumerId, height); err != nil {
-		panic(fmt.Errorf("failed to set init chain height: %w", err))
-	}
-}
-
-// GetInitChainHeight returns the provider block height when the given consumer chain was initiated
-func (k Keeper) GetInitChainHeight(ctx context.Context, consumerId uint64) (uint64, bool) {
-	height, err := k.InitChainHeight.Get(ctx, consumerId)
-	if err != nil {
-		return 0, false
-	}
-	return height, true
-}
-
-// DeleteInitChainHeight deletes the stored block height at which the given consumer chain was initialized
-func (k Keeper) DeleteInitChainHeight(ctx context.Context, consumerId uint64) {
-	if err := k.InitChainHeight.Remove(ctx, consumerId); err != nil {
-		panic(fmt.Errorf("failed to delete init chain height: %w", err))
-	}
-}
-
 // GetPendingVSCPackets returns the list of pending ValidatorSetChange packets stored under consumer id
 func (k Keeper) GetPendingVSCPackets(ctx context.Context, consumerId uint64) []vaastypes.ValidatorSetChangePacketData {
 	packets, err := k.PendingVSCPackets.Get(ctx, consumerId)
@@ -613,7 +639,9 @@ func (k Keeper) BondDenom(ctx sdk.Context) (string, error) {
 	return k.stakingKeeper.BondDenom(ctx)
 }
 
-// GetAllConsumerIds returns all the existing consumer ids
+// GetAllConsumerIds returns every consumer id ever created, deleted ones
+// included, in increasing order. Only ExportGenesis walks it, so deleted
+// consumers round-trip; every other walk uses GetLiveConsumerIds.
 func (k Keeper) GetAllConsumerIds(ctx context.Context) []uint64 {
 	latestConsumerId, found := k.GetConsumerId(ctx)
 	if !found {
@@ -628,10 +656,29 @@ func (k Keeper) GetAllConsumerIds(ctx context.Context) []uint64 {
 	return consumerIds
 }
 
-// GetAllActiveConsumerIds returns all the consumer ids of chains that are registered, initialized, or launched
+// GetLiveConsumerIds returns the ids of every consumer that is not deleted,
+// in increasing order. That is every consumer whose per-validator state may
+// still be live: key assignments, the stored validator set, and the downtime
+// and fee bookkeeping all survive a pause (which can be resumed) and a stop
+// (until removal completes), and only DeleteConsumerChain clears them.
+func (k Keeper) GetLiveConsumerIds(ctx context.Context) []uint64 {
+	iter, err := k.LiveConsumerIds.Iterate(ctx, nil)
+	if err != nil {
+		panic(fmt.Errorf("failed to iterate live consumer ids: %w", err))
+	}
+	defer iter.Close()
+
+	consumerIds, err := iter.Keys()
+	if err != nil {
+		panic(fmt.Errorf("failed to read live consumer ids: %w", err))
+	}
+	return consumerIds
+}
+
+// GetAllActiveConsumerIds returns all the consumer ids of chains that are registered, initialized, launched, or paused
 func (k Keeper) GetAllActiveConsumerIds(ctx context.Context) []uint64 {
 	consumerIds := []uint64{}
-	for _, consumerId := range k.GetAllConsumerIds(ctx) {
+	for _, consumerId := range k.GetLiveConsumerIds(ctx) {
 		if !k.IsConsumerActive(ctx, consumerId) {
 			continue
 		}
@@ -643,7 +690,7 @@ func (k Keeper) GetAllActiveConsumerIds(ctx context.Context) []uint64 {
 // GetAllLaunchedConsumerIds returns all consumer ids in the launched phase.
 func (k Keeper) GetAllLaunchedConsumerIds(ctx context.Context) []uint64 {
 	consumerIds := []uint64{}
-	for _, consumerId := range k.GetAllConsumerIds(ctx) {
+	for _, consumerId := range k.GetLiveConsumerIds(ctx) {
 		if k.GetConsumerPhase(ctx, consumerId) != types.CONSUMER_PHASE_LAUNCHED {
 			continue
 		}
@@ -1022,6 +1069,67 @@ func (k Keeper) DeleteConsumerPausedAt(ctx context.Context, consumerId uint64) {
 	}
 }
 
+// SetConsumerForkKnownAt records when the provider learned that consumerId,
+// paused for a light-client attack, forked.
+func (k Keeper) SetConsumerForkKnownAt(ctx context.Context, consumerId uint64, forkKnownAt time.Time) error {
+	buf, err := forkKnownAt.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("failed to marshal fork-known-at time (%+v) for consumer id (%d): %w", forkKnownAt, consumerId, err)
+	}
+	if err := k.ConsumerForkKnownAt.Set(ctx, consumerId, buf); err != nil {
+		return fmt.Errorf("failed to set fork-known-at time for consumer id (%d): %w", consumerId, err)
+	}
+	return nil
+}
+
+// GetConsumerForkKnownAt returns when the provider learned that consumerId
+// forked; an error wrapping collections.ErrNotFound when it is not paused for
+// a light-client attack.
+func (k Keeper) GetConsumerForkKnownAt(ctx context.Context, consumerId uint64) (time.Time, error) {
+	buf, err := k.ConsumerForkKnownAt.Get(ctx, consumerId)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to retrieve fork-known-at time for consumer id (%d): %w", consumerId, err)
+	}
+	var t time.Time
+	if err := t.UnmarshalBinary(buf); err != nil {
+		return time.Time{}, fmt.Errorf("failed to unmarshal fork-known-at time for consumer id (%d): %w", consumerId, err)
+	}
+	return t, nil
+}
+
+// DeleteConsumerForkKnownAt forgets when the provider learned that
+// consumerId forked.
+func (k Keeper) DeleteConsumerForkKnownAt(ctx context.Context, consumerId uint64) {
+	if err := k.ConsumerForkKnownAt.Remove(ctx, consumerId); err != nil {
+		panic(fmt.Errorf("failed to delete fork-known-at time for consumer id (%d): %w", consumerId, err))
+	}
+}
+
+// SetConsumerClientRecoveredSinceFork records that the client of consumerId,
+// paused for a light-client attack, was seen Active after the fork became
+// known.
+func (k Keeper) SetConsumerClientRecoveredSinceFork(ctx context.Context, consumerId uint64) error {
+	return k.ConsumerClientRecoveredSinceFork.Set(ctx, consumerId)
+}
+
+// IsConsumerClientRecoveredSinceFork reports whether the client of
+// consumerId was seen Active since its fork became known.
+func (k Keeper) IsConsumerClientRecoveredSinceFork(ctx context.Context, consumerId uint64) (bool, error) {
+	recovered, err := k.ConsumerClientRecoveredSinceFork.Has(ctx, consumerId)
+	if err != nil {
+		return false, fmt.Errorf("failed to read the client-recovered mark for consumer id (%d): %w", consumerId, err)
+	}
+	return recovered, nil
+}
+
+// DeleteConsumerClientRecoveredSinceFork forgets that the client of
+// consumerId was seen Active since its fork became known.
+func (k Keeper) DeleteConsumerClientRecoveredSinceFork(ctx context.Context, consumerId uint64) {
+	if err := k.ConsumerClientRecoveredSinceFork.Remove(ctx, consumerId); err != nil {
+		panic(fmt.Errorf("failed to delete the client-recovered mark for consumer id (%d): %w", consumerId, err))
+	}
+}
+
 // GetConsumersToBeAutoStopped returns all the consumer ids scheduled to be
 // auto-stopped (see BeginBlockAutoStopPausedConsumers) at this expiration time.
 func (k Keeper) GetConsumersToBeAutoStopped(ctx context.Context, expirationTime time.Time) (types.ConsumerIds, error) {
@@ -1340,8 +1448,10 @@ func (k Keeper) ConsumeConsumerAddrsToPrune(
 			k.Logger(ctx).Error("bytesToTime failed", "error", err.Error())
 			continue
 		}
+		// The key orders the consumer's entries by prune time (see
+		// timeToBytes), so the first entry past ts ends the due ones.
 		if pruneTs.After(ts) {
-			continue
+			break
 		}
 
 		keysToDel = append(keysToDel, kv.Key)

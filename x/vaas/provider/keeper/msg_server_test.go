@@ -1,6 +1,7 @@
 package keeper_test
 
 import (
+	stdmath "math"
 	"strconv"
 	"sync"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/codec/address"
 	cryptocodec "github.com/cosmos/cosmos-sdk/crypto/codec"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	disttypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
 	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
@@ -139,7 +141,7 @@ func TestCreateConsumerDuplicateChainId(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), response.ConsumerId)
 
-	// Attempt to register another consumer with the same chainId — rejected before unbonding check
+	// Attempt to register another consumer with the same chainId: rejected before the unbonding check
 	_, err = msgServer.CreateConsumer(ctx,
 		&providertypes.MsgCreateConsumer{
 			Submitter: "submitter2", ChainId: "duplicateChainId", Metadata: consumerMetadata,
@@ -299,6 +301,9 @@ func TestUpdateConsumerDuplicateChainId(t *testing.T) {
 	require.Equal(t, chainId2, actualChainId)
 }
 
+// doubleVotingChainID is the consumer chain id of the double-voting tests.
+const doubleVotingChainID = "consumer-chain-id"
+
 func TestSubmitConsumerDoubleVotingRejectsMismatchedChainID(t *testing.T) {
 	providerKeeper, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
@@ -306,9 +311,10 @@ func TestSubmitConsumerDoubleVotingRejectsMismatchedChainID(t *testing.T) {
 	msgServer := providerkeeper.NewMsgServerImpl(&providerKeeper)
 
 	consumerID := uint64(0)
-	storedChainID := "consumer-chain-id"
+	storedChainID := doubleVotingChainID
 	differentChainID := "different-chain-id"
 	providerKeeper.SetConsumerChainId(ctx, consumerID, storedChainID)
+	providerKeeper.SetConsumerPhase(ctx, consumerID, providertypes.CONSUMER_PHASE_LAUNCHED)
 
 	height := int64(12)
 	evidence, valSet := makeDuplicateVoteEvidenceProtoWithValSet(t, differentChainID, height)
@@ -325,8 +331,41 @@ func TestSubmitConsumerDoubleVotingRejectsMismatchedChainID(t *testing.T) {
 		_, err := msgServer.SubmitConsumerDoubleVoting(ctx, msg)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "infraction block header chain id")
-		require.Contains(t, err.Error(), "does not match consumer chain id")
+		require.Contains(t, err.Error(), "is not consumer 0's chain id")
 	})
+}
+
+// TestSubmitConsumerDoubleVotingRefusesAConsumerThatIsNotLaunched: the phase
+// gate runs before the chain id is read, so a deleted consumer, whose chain
+// id deletion released, is refused with the double-voting evidence error
+// like a registered one, not with a missing-state error.
+func TestSubmitConsumerDoubleVotingRefusesAConsumerThatIsNotLaunched(t *testing.T) {
+	providerKeeper, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+	msgServer := providerkeeper.NewMsgServerImpl(&providerKeeper)
+
+	chainID := doubleVotingChainID
+	height := int64(12)
+	evidence, valSet := makeDuplicateVoteEvidenceProtoWithValSet(t, chainID, height)
+	header := makeHeader(t, chainID, height, valSet)
+
+	registered := providerKeeper.FetchAndIncrementConsumerId(ctx)
+	providerKeeper.SetConsumerPhase(ctx, registered, providertypes.CONSUMER_PHASE_REGISTERED)
+	providerKeeper.SetConsumerChainId(ctx, registered, chainID)
+	deleted := providerKeeper.FetchAndIncrementConsumerId(ctx)
+	providerKeeper.SetConsumerPhase(ctx, deleted, providertypes.CONSUMER_PHASE_DELETED)
+
+	for _, consumerID := range []uint64{registered, deleted} {
+		_, err := msgServer.SubmitConsumerDoubleVoting(ctx, &providertypes.MsgSubmitConsumerDoubleVoting{
+			ConsumerId:            consumerID,
+			Submitter:             validSubmitter(),
+			DuplicateVoteEvidence: evidence,
+			InfractionBlockHeader: header,
+		})
+		require.ErrorIs(t, err, vaastypes.ErrInvalidDoubleVotingEvidence, "consumer %d", consumerID)
+		require.ErrorContains(t, err, "has not launched or is deleted")
+	}
+	require.ErrorIs(t, providerKeeper.HandleConsumerDoubleVoting(ctx, deleted, nil, nil), vaastypes.ErrInvalidDoubleVotingEvidence)
 }
 
 func TestSubmitConsumerDoubleVotingHappyPath(t *testing.T) {
@@ -336,7 +375,7 @@ func TestSubmitConsumerDoubleVotingHappyPath(t *testing.T) {
 	msgServer := providerkeeper.NewMsgServerImpl(&providerKeeper)
 
 	consumerID := uint64(0)
-	chainID := "consumer-chain-id"
+	chainID := doubleVotingChainID
 	providerKeeper.SetConsumerChainId(ctx, consumerID, chainID)
 	providerKeeper.SetConsumerPhase(ctx, consumerID, providertypes.CONSUMER_PHASE_LAUNCHED)
 	providerKeeper.SetInfractionParams(ctx, providertypes.DefaultInfractionParameters())
@@ -539,6 +578,16 @@ func TestSetConsumerFeesPerBlock(t *testing.T) {
 			name:       "amount above global stored",
 			amount:     "2500",
 			wantAmount: math.NewInt(2500),
+		},
+		{
+			name:       "amount whose epoch fee lands on the int64 bound stored",
+			amount:     strconv.FormatInt(stdmath.MaxInt64/providertypes.DefaultBlocksPerEpoch, 10),
+			wantAmount: math.NewInt(stdmath.MaxInt64 / providertypes.DefaultBlocksPerEpoch),
+		},
+		{
+			name:       "amount whose epoch fee passes int64 rejected",
+			amount:     strconv.FormatInt(stdmath.MaxInt64/providertypes.DefaultBlocksPerEpoch+1, 10),
+			wantErrMsg: "must fit an int64",
 		},
 		{
 			name:       "amount equal to global rejected",
@@ -1019,7 +1068,7 @@ func TestResumeConsumerGovAuth(t *testing.T) {
 
 	providerKeeper.SetInfractionParams(ctx, providertypes.DefaultInfractionParameters())
 
-	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).Times(1)
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).AnyTimes()
 
 	msgServer := providerkeeper.NewMsgServerImpl(&providerKeeper)
 
@@ -1053,6 +1102,7 @@ func TestResumeConsumerGovAuth(t *testing.T) {
 
 	// correct authority succeeds
 	mocks.MockClientKeeper.EXPECT().GetClientStatus(gomock.Any(), "07-tendermint-0").Return(ibcexported.Active)
+	mocks.MockClientKeeper.EXPECT().GetClientState(gomock.Any(), "07-tendermint-0").Return(&ibctmtypes.ClientState{ChainId: "chainId", TrustingPeriod: 14 * 24 * time.Hour}, true).AnyTimes()
 	mocks.MockStakingKeeper.EXPECT().MaxValidators(gomock.Any()).Return(uint32(100), nil).AnyTimes()
 	mocks.MockStakingKeeper.EXPECT().GetBondedValidatorsByPower(gomock.Any()).Return([]stakingtypes.Validator{}, nil).AnyTimes()
 	mocks.MockChannelV2Keeper.EXPECT().
@@ -1204,7 +1254,7 @@ func TestUpdateConsumerLaunchedOnlyMetadata(t *testing.T) {
 			NewChainId: "newChainId",
 		})
 	require.Error(t, err)
-	require.ErrorIs(t, err, providertypes.ErrInvalidPhase)
+	require.ErrorIs(t, err, providertypes.ErrUnauthorized)
 
 	// owner transfer should succeed on launched chain
 	newOwner := declOwner
@@ -1801,6 +1851,20 @@ func TestCreateConsumerUnbondingBounds(t *testing.T) {
 			unbondingPeriod: time.Hour,
 			wantErr:         true,
 		},
+		{
+			// Above the horizon itself, but a client's trusting period is a
+			// fraction of it (TrustingPeriodFraction, 0.66 by default): 11
+			// days give 7.26, under the 10-day horizon, so no declarable
+			// client exists and registration refuses it.
+			name:            "trusting period at the fraction below the horizon: rejected",
+			unbondingPeriod: 11 * 24 * time.Hour,
+			wantErr:         true,
+		},
+		{
+			name:            "trusting period at the fraction above the horizon: ok",
+			unbondingPeriod: 16 * 24 * time.Hour,
+			wantErr:         false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -2083,15 +2147,11 @@ func TestUpdateConsumerUnbondingBounds(t *testing.T) {
 	}
 }
 
-// TestUpdateConsumerRejectsPausedConsumer pins the one place that deliberately
-// treats PAUSED as ineligible even though IsConsumerActive accepts it.
-//
-// An update can rewrite the infraction parameters and initialization
-// parameters that the challenge which paused the consumer was judged under,
-// and the resume path replays state built from them. Governance resumes or
-// removes the consumer first, then updates it. Key assignment, by contrast, is
-// available during a pause.
-func TestUpdateConsumerRejectsPausedConsumer(t *testing.T) {
+// TestUpdateConsumerOnPausedConsumer: a paused consumer stays updatable for
+// what a launched one is (metadata, ownership, and the client declaration a
+// refusal pause may have pre-empted); its initialization parameters are
+// frozen, and only governance renames it, to its client's chain id.
+func TestUpdateConsumerOnPausedConsumer(t *testing.T) {
 	providerKeeper, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
 
@@ -2100,15 +2160,152 @@ func TestUpdateConsumerRejectsPausedConsumer(t *testing.T) {
 	owner := declOwner
 	consumerId := providerKeeper.FetchAndIncrementConsumerId(ctx)
 	providerKeeper.SetConsumerOwnerAddress(ctx, consumerId, owner)
+	providerKeeper.SetConsumerChainId(ctx, consumerId, "paused-1")
 	providerKeeper.SetConsumerPhase(ctx, consumerId, providertypes.CONSUMER_PHASE_PAUSED)
+	require.NoError(t, providerKeeper.SetConsumerInitializationParameters(ctx, consumerId, providertypes.ConsumerInitializationParameters{
+		InitialHeight: clienttypes.NewHeight(1, 1), SpawnTime: time.Unix(1_700_000_000, 0).UTC(),
+	}))
 
+	renamed := &providertypes.ConsumerMetadata{Name: "renamed", Description: "d", Metadata: "m"}
 	_, err := msgServer.UpdateConsumer(ctx, &providertypes.MsgUpdateConsumer{
-		Owner:      owner,
-		ConsumerId: consumerId,
-		Metadata: &providertypes.ConsumerMetadata{
-			Name: "renamed", Description: "d", Metadata: "m",
-		},
+		Owner: owner, ConsumerId: consumerId, Metadata: renamed,
 	})
-	require.ErrorIs(t, err, providertypes.ErrInvalidPhase,
-		"a paused consumer must not be updatable")
+	require.NoError(t, err, "metadata stays updatable on a paused consumer")
+	got, err := providerKeeper.GetConsumerMetadata(ctx, consumerId)
+	require.NoError(t, err)
+	require.Equal(t, *renamed, got)
+
+	_, err = msgServer.UpdateConsumer(ctx, &providertypes.MsgUpdateConsumer{
+		Owner: owner, ConsumerId: consumerId,
+		InitializationParameters: &providertypes.ConsumerInitializationParameters{UnbondingPeriod: time.Hour},
+	})
+	require.ErrorIs(t, err, providertypes.ErrInvalidPhase, "initialization parameters are frozen after launch")
+
+	_, err = msgServer.UpdateConsumer(ctx, &providertypes.MsgUpdateConsumer{
+		Owner: owner, ConsumerId: consumerId, NewChainId: "paused-2",
+	})
+	require.ErrorIs(t, err, providertypes.ErrUnauthorized, "only governance renames a consumer that has launched")
+}
+
+// registrationFeeMsg is a valid MsgCreateConsumer from submitter, for the
+// registration fee tests.
+func registrationFeeMsg(submitter string) *providertypes.MsgCreateConsumer {
+	return &providertypes.MsgCreateConsumer{
+		Submitter: submitter,
+		ChainId:   "chainId",
+		Metadata:  providertypes.ConsumerMetadata{Name: "chain name"},
+		InitializationParameters: &providertypes.ConsumerInitializationParameters{
+			UnbondingPeriod: 21 * 24 * time.Hour,
+		},
+	}
+}
+
+// TestCreateConsumerChargesAndBurnsTheRegistrationFee: with a positive
+// consumer registration fee, creating a consumer moves the fee from the
+// submitter to the module account and burns it there, in that order.
+func TestCreateConsumerChargesAndBurnsTheRegistrationFee(t *testing.T) {
+	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).AnyTimes()
+
+	fee := sdk.NewInt64Coin(providertypes.DefaultFeesPerBlockDenom, 5_000_000)
+	params := providertypes.DefaultParams()
+	params.ConsumerRegistrationFee = fee
+	k.SetParams(ctx, params)
+
+	submitter := validSubmitter()
+	submitterAddr := sdk.MustAccAddressFromBech32(submitter)
+	gomock.InOrder(
+		mocks.MockBankKeeper.EXPECT().
+			SendCoinsFromAccountToModule(ctx, submitterAddr, providertypes.ModuleName, sdk.NewCoins(fee)).Return(nil),
+		mocks.MockBankKeeper.EXPECT().
+			BurnCoins(ctx, providertypes.ModuleName, sdk.NewCoins(fee)).Return(nil),
+	)
+
+	msgSrv := providerkeeper.NewMsgServerImpl(&k)
+	resp, err := msgSrv.CreateConsumer(ctx, registrationFeeMsg(submitter))
+	require.NoError(t, err)
+	require.Equal(t, providertypes.CONSUMER_PHASE_REGISTERED, k.GetConsumerPhase(ctx, resp.ConsumerId))
+}
+
+// TestCreateConsumerRefusesASubmitterWhoCannotPayTheRegistrationFee: the fee
+// is collected before anything is written, so a failed collection leaves no
+// consumer behind, not even a taken id, and nothing is burned.
+func TestCreateConsumerRefusesASubmitterWhoCannotPayTheRegistrationFee(t *testing.T) {
+	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+
+	fee := sdk.NewInt64Coin(providertypes.DefaultFeesPerBlockDenom, 5_000_000)
+	params := providertypes.DefaultParams()
+	params.ConsumerRegistrationFee = fee
+	k.SetParams(ctx, params)
+
+	submitter := validSubmitter()
+	mocks.MockBankKeeper.EXPECT().
+		SendCoinsFromAccountToModule(ctx, sdk.MustAccAddressFromBech32(submitter), providertypes.ModuleName, sdk.NewCoins(fee)).
+		Return(sdkerrors.ErrInsufficientFunds)
+
+	msgSrv := providerkeeper.NewMsgServerImpl(&k)
+	_, err := msgSrv.CreateConsumer(ctx, registrationFeeMsg(submitter))
+	require.ErrorIs(t, err, sdkerrors.ErrInsufficientFunds)
+
+	_, taken := k.GetConsumerId(ctx)
+	require.False(t, taken, "no consumer id may be taken")
+	require.Empty(t, k.GetLiveConsumerIds(ctx))
+}
+
+// TestCreateConsumerChargesNothingWhenTheRegistrationFeeIsZero: the default
+// fee is zero, which disables it: no bank call is made at all (the mock would
+// fail on one), and the consumer is created.
+func TestCreateConsumerChargesNothingWhenTheRegistrationFeeIsZero(t *testing.T) {
+	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).AnyTimes()
+	require.True(t, k.GetParams(ctx).ConsumerRegistrationFee.IsZero())
+
+	msgSrv := providerkeeper.NewMsgServerImpl(&k)
+	resp, err := msgSrv.CreateConsumer(ctx, registrationFeeMsg(validSubmitter()))
+	require.NoError(t, err)
+	require.Equal(t, providertypes.CONSUMER_PHASE_REGISTERED, k.GetConsumerPhase(ctx, resp.ConsumerId))
+}
+
+// TestUpdateParamsChangesTheConsumerRegistrationFee: the registration fee is
+// governed through the same diff as every other parameter. Set alone it
+// changes alone; a positive fee in a denom other than the fee denom is
+// rejected with nothing applied; a zero fee is accepted in any valid denom,
+// since it charges nothing.
+func TestUpdateParamsChangesTheConsumerRegistrationFee(t *testing.T) {
+	k, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+	before := providertypes.DefaultParams()
+	before.BlocksPerEpoch = 300
+	k.SetParams(ctx, before)
+	msgSrv := providerkeeper.NewMsgServerImpl(&k)
+
+	fee := sdk.NewInt64Coin(providertypes.DefaultFeesPerBlockDenom, 1_000_000)
+	_, err := msgSrv.UpdateParams(ctx, &providertypes.MsgUpdateParams{
+		Authority:               k.GetAuthority(),
+		ConsumerRegistrationFee: &fee,
+	})
+	require.NoError(t, err)
+	want := before
+	want.ConsumerRegistrationFee = fee
+	require.Equal(t, want, k.GetParams(ctx))
+
+	other := sdk.NewInt64Coin("uatone", 1)
+	_, err = msgSrv.UpdateParams(ctx, &providertypes.MsgUpdateParams{
+		Authority:               k.GetAuthority(),
+		ConsumerRegistrationFee: &other,
+	})
+	require.ErrorContains(t, err, "is not the fee denom")
+	require.Equal(t, want, k.GetParams(ctx), "a rejected update must not have been applied")
+
+	zero := sdk.NewInt64Coin("uatone", 0)
+	_, err = msgSrv.UpdateParams(ctx, &providertypes.MsgUpdateParams{
+		Authority:               k.GetAuthority(),
+		ConsumerRegistrationFee: &zero,
+	})
+	require.NoError(t, err)
+	want.ConsumerRegistrationFee = zero
+	require.Equal(t, want, k.GetParams(ctx))
 }

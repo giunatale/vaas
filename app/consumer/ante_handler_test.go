@@ -22,6 +22,7 @@ import (
 
 	errorsmod "cosmossdk.io/errors"
 	"cosmossdk.io/log"
+	sdkmath "cosmossdk.io/math"
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	clienttx "github.com/cosmos/cosmos-sdk/client/tx"
@@ -32,6 +33,7 @@ import (
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	simtestutil "github.com/cosmos/cosmos-sdk/testutil/sims"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	signingtypes "github.com/cosmos/cosmos-sdk/types/tx/signing"
 	"github.com/cosmos/cosmos-sdk/x/auth/ante"
 	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
@@ -56,11 +58,27 @@ func (o testAppOptions) Get(key string) any { return o[key] }
 // and runs it through InitChain, one finalized block, and a commit, so the
 // ante chain sees the same committed module state (auth params, bank send
 // config, consumer params) a live node has. The consumer module is
-// initialized from an enabled restart genesis carrying one validator and the
+// initialized from a restart genesis carrying one validator and the
 // pinned provider client, the state a launched consumer runs with, with the
 // photon-only fee policy set as the chain would set it: through the
 // photon_fees_enabled consumer param.
 func setupAnteTestApp(t *testing.T, photonFees bool) *consumerapp.App {
+	t.Helper()
+	return setupAnteTestAppPinning(t, photonFees, providerClientID)
+}
+
+// setupUnpinnedAnteTestApp is setupAnteTestApp for a chain still in
+// bootstrap: the relayer-created provider client exists in the IBC store, but
+// the restart genesis pins none, as the export of a chain that had not been
+// pinned yet carries.
+func setupUnpinnedAnteTestApp(t *testing.T, photonFees bool) *consumerapp.App {
+	t.Helper()
+	return setupAnteTestAppPinning(t, photonFees, "")
+}
+
+// setupAnteTestAppPinning builds the app of setupAnteTestApp with pinnedClient
+// as the restart genesis's provider client id, empty for none.
+func setupAnteTestAppPinning(t *testing.T, photonFees bool, pinnedClient string) *consumerapp.App {
 	t.Helper()
 
 	db := dbm.NewMemDB()
@@ -75,7 +93,7 @@ func setupAnteTestApp(t *testing.T, photonFees bool) *consumerapp.App {
 	params := vaastypes.DefaultConsumerParams()
 	params.PhotonFeesEnabled = photonFees
 	consumerGenesis := consumertypes.NewRestartGenesisState(
-		providerClientID,
+		pinnedClient,
 		[]abci.ValidatorUpdate{{PubKey: valPubKey, Power: 100}},
 		params,
 	)
@@ -166,17 +184,34 @@ func fundedSigner(t *testing.T, capp *consumerapp.App, ctx sdk.Context, funds sd
 // given fee, exercising the full ante chain including signature verification.
 func signedBankSendTx(t *testing.T, capp *consumerapp.App, ctx sdk.Context, priv cryptotypes.PrivKey, addr sdk.AccAddress, fee sdk.Coins) sdk.Tx {
 	t.Helper()
+	return signedTx(t, capp, ctx, priv, addr, fee, bankSendMsg(addr))
+}
 
-	txConfig := capp.TxConfig()
-	txBuilder := txConfig.NewTxBuilder()
-	msg := &banktypes.MsgSend{
+// bankSendMsg is the user message the ante tests carry: a self-send of one
+// unit, enough to reach the fee decorators as ordinary user traffic.
+func bankSendMsg(addr sdk.AccAddress) sdk.Msg {
+	return &banktypes.MsgSend{
 		FromAddress: addr.String(),
 		ToAddress:   addr.String(),
 		Amount:      sdk.NewCoins(sdk.NewInt64Coin("stake", 1)),
 	}
-	require.NoError(t, txBuilder.SetMsgs(msg))
+}
+
+// anteTestGasLimit is the gas limit every signed test transaction declares; a
+// fee floor expressed per gas unit prices a transaction against it.
+const anteTestGasLimit = 300000
+
+// signedTx builds a properly signed transaction carrying the given messages
+// and fee under anteTestGasLimit, exercising the full ante chain including
+// signature verification.
+func signedTx(t *testing.T, capp *consumerapp.App, ctx sdk.Context, priv cryptotypes.PrivKey, addr sdk.AccAddress, fee sdk.Coins, msgs ...sdk.Msg) sdk.Tx {
+	t.Helper()
+
+	txConfig := capp.TxConfig()
+	txBuilder := txConfig.NewTxBuilder()
+	require.NoError(t, txBuilder.SetMsgs(msgs...))
 	txBuilder.SetFeeAmount(fee)
-	txBuilder.SetGasLimit(300000)
+	txBuilder.SetGasLimit(anteTestGasLimit)
 
 	acc := capp.AccountKeeper.GetAccount(ctx, addr)
 	require.NotNil(t, acc)
@@ -315,6 +350,152 @@ func TestConsumerAnteHandlerPhotonFees(t *testing.T) {
 				require.Error(t, err)
 				require.True(t, errorsmod.IsOf(err, consumertypes.ErrInvalidFeeDenom),
 					"rejection must come from the photon fee policy, got: %v", err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestConsumerAnteHandlerNodeFeeFloor runs signed transactions through the
+// reference consumer app's full ante chain at CheckTx under a node fee floor
+// set in the photon voucher denom, the floor a photon-fees consumer's
+// validators configure once the voucher denom is known. The floor is the
+// node's minimum-gas-prices as the bootstrap-exempt checker applies it:
+// bootstrap traffic skips it while no routable provider client is pinned and
+// again while no voucher exists on the chain, every transaction pays it
+// otherwise, and it is mempool policy only, so it never runs outside CheckTx.
+func TestConsumerAnteHandlerNodeFeeFloor(t *testing.T) {
+	photonDenom := consumerante.ExpectedPhotonDenom(providerClientID)
+	// 0.01 voucher per gas unit prices a transaction at 3000 vouchers under
+	// the test gas limit.
+	floor := sdk.NewDecCoins(sdk.NewDecCoinFromDec(photonDenom, sdkmath.LegacyMustNewDecFromStr("0.01")))
+	const requiredFee = anteTestGasLimit / 100
+
+	// The phases of the provider client the transaction meets.
+	const (
+		unpinned   = iota // no pin at all: the chain bootstraps
+		unroutable        // pinned with no registered counterparty, which only a restart genesis produces
+		routable          // pinned and routable: the bootstrap is over
+	)
+	apps := map[bool]*consumerapp.App{
+		false: setupAnteTestApp(t, true),
+		true:  setupUnpinnedAnteTestApp(t, true),
+	}
+
+	testCases := []struct {
+		name      string
+		checkTx   bool
+		infra     bool
+		phase     int
+		fee       sdk.Coins
+		funds     sdk.Coins
+		expectErr bool
+		photonErr bool
+	}{
+		{
+			name:      "user tx below the floor is rejected at CheckTx",
+			checkTx:   true,
+			phase:     routable,
+			fee:       sdk.NewCoins(sdk.NewInt64Coin(photonDenom, requiredFee-1)),
+			funds:     sdk.NewCoins(sdk.NewInt64Coin(photonDenom, requiredFee)),
+			expectErr: true,
+		},
+		{
+			name:    "user tx at the floor is admitted",
+			checkTx: true,
+			phase:   routable,
+			fee:     sdk.NewCoins(sdk.NewInt64Coin(photonDenom, requiredFee)),
+			funds:   sdk.NewCoins(sdk.NewInt64Coin(photonDenom, requiredFee)),
+		},
+		{
+			name:    "fee-less infrastructure tx is admitted under the floor before the pin",
+			checkTx: true,
+			infra:   true,
+			phase:   unpinned,
+			fee:     sdk.NewCoins(),
+		},
+		{
+			name:    "fee-less infrastructure tx is admitted under the floor while the pin is not routable",
+			checkTx: true,
+			infra:   true,
+			phase:   unroutable,
+			fee:     sdk.NewCoins(),
+		},
+		{
+			// The photon policy, which sits before fee deduction, refuses the
+			// empty fee first; the floor would refuse it next. The signer's
+			// vouchers mean the chain holds some.
+			name:      "fee-less infrastructure tx is rejected once the pin is routable",
+			checkTx:   true,
+			infra:     true,
+			phase:     routable,
+			fee:       sdk.NewCoins(),
+			funds:     sdk.NewCoins(sdk.NewInt64Coin(photonDenom, requiredFee)),
+			expectErr: true,
+			photonErr: true,
+		},
+		{
+			// Routable, but no voucher exists anywhere on the chain: the
+			// delivery that would bring the first one must get through.
+			name:    "fee-less infrastructure tx is admitted under the floor while no voucher exists",
+			checkTx: true,
+			infra:   true,
+			phase:   routable,
+			fee:     sdk.NewCoins(),
+		},
+		{
+			name:      "a fee-less user tx is still refused while no voucher exists",
+			checkTx:   true,
+			phase:     routable,
+			fee:       sdk.NewCoins(),
+			expectErr: true,
+			photonErr: true,
+		},
+		{
+			name:  "the floor does not apply outside CheckTx",
+			phase: routable,
+			fee:   sdk.NewCoins(sdk.NewInt64Coin(photonDenom, 1)),
+			funds: sdk.NewCoins(sdk.NewInt64Coin(photonDenom, 1)),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			capp := apps[tc.phase == unpinned]
+			ctx := anteTestContext(capp).WithIsCheckTx(tc.checkTx).WithMinGasPrices(floor)
+			// With a registered counterparty the pinned provider client is
+			// routable, so the bootstrap is over: the photon policy is
+			// enforcing and every user fee below is a voucher fee.
+			if tc.phase == routable {
+				capp.IBCKeeper.ClientV2Keeper.SetClientCounterparty(ctx, providerClientID, clientv2types.CounterpartyInfo{
+					ClientId: "07-tendermint-9",
+				})
+			}
+
+			priv, addr := fundedSigner(t, capp, ctx, tc.funds)
+			msg := bankSendMsg(addr)
+			if tc.infra {
+				// A relayer's counterparty registration: /ibc.core.* plumbing
+				// the ante chain admits without executing.
+				msg = &clientv2types.MsgRegisterCounterparty{
+					ClientId:             providerClientID,
+					CounterpartyClientId: "07-tendermint-9",
+					Signer:               addr.String(),
+				}
+			}
+			tx := signedTx(t, capp, ctx, priv, addr, tc.fee, msg)
+
+			_, err := newAppAnteHandler(t, capp)(ctx, tx, false)
+			if tc.expectErr {
+				require.Error(t, err)
+				if tc.photonErr {
+					require.True(t, errorsmod.IsOf(err, consumertypes.ErrInvalidFeeDenom),
+						"rejection must come from the photon policy, got: %v", err)
+					return
+				}
+				require.True(t, errorsmod.IsOf(err, sdkerrors.ErrInsufficientFee),
+					"rejection must come from the fee floor, got: %v", err)
 				return
 			}
 			require.NoError(t, err)

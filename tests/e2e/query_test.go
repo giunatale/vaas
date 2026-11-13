@@ -3,8 +3,14 @@ package e2e
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"time"
+
+	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 
 	cmtservice "github.com/cosmos/cosmos-sdk/client/grpc/cmtservice"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/bech32"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 )
@@ -13,12 +19,14 @@ import (
 // from the provider chain (e.g. phaseLaunched).
 // Consumer phases as the provider's consumer-chain query prints them.
 const (
-	phaseLaunched = "CONSUMER_PHASE_LAUNCHED"
-	phaseStopped  = "CONSUMER_PHASE_STOPPED"
-	phaseDeleted  = "CONSUMER_PHASE_DELETED"
+	phaseRegistered = "CONSUMER_PHASE_REGISTERED"
+	phaseLaunched   = "CONSUMER_PHASE_LAUNCHED"
+	phasePaused     = "CONSUMER_PHASE_PAUSED"
+	phaseStopped    = "CONSUMER_PHASE_STOPPED"
+	phaseDeleted    = "CONSUMER_PHASE_DELETED"
 )
 
-func (s *baseTestSuite) queryProviderConsumerPhase(consumerID string) string { //nolint:unparam // the suite drives one consumer; the helper stays generic
+func (s *baseTestSuite) queryProviderConsumerPhase(consumerID string) string {
 	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
 		providerBinary, "query", "vaasprovider", "consumer-chain", consumerID,
 		"--home", providerHomePath,
@@ -58,6 +66,18 @@ func (s *baseTestSuite) consumerRPCEndpoint() string {
 	return fmt.Sprintf("http://%s", s.consumerValRes[0].GetHostPort("26657/tcp"))
 }
 
+// providerCometClient returns a CometBFT RPC client on provider val0, for
+// what the chain's REST API does not serve: past validator sets, block
+// commits and the evidence a block carries, and evidence submission.
+func (s *baseTestSuite) providerCometClient() *rpchttp.HTTP {
+	if s.providerComet == nil {
+		client, err := rpchttp.New(s.providerRPCEndpoint(), "/websocket")
+		s.Require().NoError(err, "failed to create the provider's CometBFT RPC client")
+		s.providerComet = client
+	}
+	return s.providerComet
+}
+
 // queryProviderBlockHeight returns the current block height of the provider chain.
 func (s *baseTestSuite) queryProviderBlockHeight() (int64, error) {
 	return queryBlockHeight(s.providerRPCEndpoint())
@@ -89,7 +109,21 @@ func (s *baseTestSuite) queryProviderNetValidators() ([]*cmtservice.Validator, e
 
 // queryConsumerNetValidators queries the consumer chain for the latest consensus validator set.
 func (s *baseTestSuite) queryConsumerNetValidators() ([]*cmtservice.Validator, error) {
-	return s.queryNetValidators(s.consumerRESTEndpoint())
+	vals, err := s.queryNetValidators(s.consumerRESTEndpoint())
+	if err != nil {
+		return nil, err
+	}
+	// The consumer node encodes addresses under consumerBech32Prefix; the
+	// callers compare them with provider-side addresses, so re-encode them
+	// under this test binary's (the provider's) prefix here, once.
+	for _, v := range vals {
+		_, raw, err := bech32.DecodeAndConvert(v.Address)
+		if err != nil {
+			return nil, fmt.Errorf("decoding consumer validator address %q: %w", v.Address, err)
+		}
+		v.Address = sdk.ConsAddress(raw).String()
+	}
+	return vals, nil
 }
 
 // queryValidators queries the staking validator set via the REST API.
@@ -124,6 +158,182 @@ func (s *baseTestSuite) queryConsumerProviderInfo() (string, error) {
 		return "", err
 	}
 	return stdout.String(), nil
+}
+
+// consumerProviderClientID returns the id of the consumer's pinned IBC client
+// of the provider, the destination of the provider's VSC packets.
+func (s *baseTestSuite) consumerProviderClientID() string {
+	info, err := s.queryConsumerProviderInfo()
+	s.Require().NoError(err, "failed to query the consumer's provider info")
+	var res struct {
+		Consumer struct {
+			ClientID string `json:"client_id"`
+		} `json:"consumer"`
+	}
+	s.Require().NoErrorf(json.Unmarshal([]byte(info), &res), "failed to decode the consumer's provider info: %s", info)
+	s.Require().NotEmpty(res.Consumer.ClientID, "the consumer has no pinned provider client")
+	return res.Consumer.ClientID
+}
+
+// queryConsumerChainID returns the chain id the provider has a consumer
+// registered under.
+func (s *baseTestSuite) queryConsumerChainID(consumerID string) string {
+	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
+		providerBinary, "query", "vaasprovider", "consumer-chain", consumerID,
+		"--home", providerHomePath,
+		"--output", "json",
+	})
+	s.Require().NoErrorf(err, "failed to query consumer-chain %s", consumerID)
+	var res struct {
+		ChainID string `json:"chain_id"`
+	}
+	s.Require().NoErrorf(json.Unmarshal(stdout.Bytes(), &res), "failed to decode the consumer-chain response: %s", stdout.String())
+	return res.ChainID
+}
+
+// previousChainIDJSON is one chain id a governance rename retired, with the
+// declared client's height at the rename, as the consumer-chain query lists
+// them.
+type previousChainIDJSON struct {
+	ChainID  string `json:"chain_id"`
+	Boundary struct {
+		RevisionNumber string `json:"revision_number"`
+		RevisionHeight string `json:"revision_height"`
+	} `json:"boundary"`
+}
+
+// queryConsumerPreviousChainIDs returns the chain ids the consumer carried
+// before its governance renames, with the boundary of each.
+func (s *baseTestSuite) queryConsumerPreviousChainIDs(consumerID string) []previousChainIDJSON {
+	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
+		providerBinary, "query", "vaasprovider", "consumer-chain", consumerID,
+		"--home", providerHomePath,
+		"--output", "json",
+	})
+	s.Require().NoErrorf(err, "failed to query consumer-chain %s", consumerID)
+	var res struct {
+		PreviousChainIDs []previousChainIDJSON `json:"previous_chain_ids"`
+	}
+	s.Require().NoErrorf(json.Unmarshal(stdout.Bytes(), &res), "failed to decode the consumer-chain response: %s", stdout.String())
+	return res.PreviousChainIDs
+}
+
+// nextSequenceSend returns the sequence the provider's next IBC v2 packet over
+// the client takes; it moves exactly when the provider sends a packet over it.
+func (s *baseTestSuite) nextSequenceSend(clientID string) uint64 {
+	sequence, err := s.tryNextSequenceSend(clientID)
+	s.Require().NoErrorf(err, "failed to read the next send sequence of client %s", clientID)
+	return sequence
+}
+
+// tryNextSequenceSend is nextSequenceSend returning an error instead of
+// failing the test, for the conditions of Eventually and Never, which run in
+// a goroutine of their own: a failure there stalls the wait to its timeout.
+func (s *baseTestSuite) tryNextSequenceSend(clientID string) (uint64, error) {
+	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
+		providerBinary, "query", "ibc", "channelv2", "next-sequence-send", clientID,
+		"--prove=false",
+		"--home", providerHomePath,
+		"--output", "json",
+	})
+	if err != nil {
+		return 0, fmt.Errorf("querying the next send sequence of client %s: %w (stderr=%s)", clientID, err, stderr.String())
+	}
+	var res struct {
+		NextSequenceSend string `json:"next_sequence_send"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		return 0, fmt.Errorf("decoding the next send sequence of client %s: %w (raw=%s)", clientID, err, stdout.String())
+	}
+	sequence, err := strconv.ParseUint(res.NextSequenceSend, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("next send sequence of client %s: %q: %w", clientID, res.NextSequenceSend, err)
+	}
+	return sequence, nil
+}
+
+// blockEvent is an event a block emitted outside any transaction, as the
+// chain's block results report it: from its BeginBlock, where the provider
+// pauses a consumer whose client tracks another chain id, or its EndBlock,
+// where the provider's epoch send runs and a passed proposal executes.
+type blockEvent struct {
+	Type       string
+	Attributes map[string]string
+}
+
+// providerBlockEvents returns the events the provider's block at height
+// emitted outside any transaction.
+func (s *baseTestSuite) providerBlockEvents(height int64) []blockEvent {
+	body, err := httpGet(fmt.Sprintf("%s/block_results?height=%d", s.providerRPCEndpoint(), height))
+	s.Require().NoErrorf(err, "failed to read the provider's block results at height %d", height)
+	var res struct {
+		Result struct {
+			FinalizeBlockEvents []struct {
+				Type       string `json:"type"`
+				Attributes []struct {
+					Key   string `json:"key"`
+					Value string `json:"value"`
+				} `json:"attributes"`
+			} `json:"finalize_block_events"`
+		} `json:"result"`
+	}
+	s.Require().NoErrorf(json.Unmarshal(body, &res), "failed to decode the provider's block results at height %d: %s", height, body)
+	events := make([]blockEvent, 0, len(res.Result.FinalizeBlockEvents))
+	for _, ev := range res.Result.FinalizeBlockEvents {
+		attributes := make(map[string]string, len(ev.Attributes))
+		for _, a := range ev.Attributes {
+			attributes[a.Key] = a.Value
+		}
+		events = append(events, blockEvent{Type: ev.Type, Attributes: attributes})
+	}
+	return events
+}
+
+// providerBlockEventHeights returns, in order, the height of every event of
+// the given type whose attributes match every entry of want that the
+// provider's blocks from height from to height to inclusive emitted outside
+// any transaction; a block emitting several lists once per event.
+func (s *baseTestSuite) providerBlockEventHeights(from, to int64, eventType string, want map[string]string) []int64 {
+	var heights []int64
+	for height := from; height <= to; height++ {
+		for _, ev := range s.providerBlockEvents(height) {
+			if ev.Type == eventType && blockEventMatches(ev, want) {
+				heights = append(heights, height)
+			}
+		}
+	}
+	return heights
+}
+
+// blockEventMatches reports whether every attribute in want is on the event
+// with that value.
+func blockEventMatches(ev blockEvent, want map[string]string) bool {
+	for key, value := range want {
+		if ev.Attributes[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+// providerBlockTime returns the header time of the provider block at height:
+// the block time the keepers took every deadline set or judged in that block
+// from.
+func (s *baseTestSuite) providerBlockTime(height int64) time.Time {
+	body, err := httpGet(fmt.Sprintf("%s/block?height=%d", s.providerRPCEndpoint(), height))
+	s.Require().NoErrorf(err, "failed to read the provider's block %d", height)
+	var res struct {
+		Result struct {
+			Block struct {
+				Header struct {
+					Time time.Time `json:"time"`
+				} `json:"header"`
+			} `json:"block"`
+		} `json:"result"`
+	}
+	s.Require().NoErrorf(json.Unmarshal(body, &res), "failed to decode the provider's block %d: %s", height, body)
+	s.Require().Falsef(res.Result.Block.Header.Time.IsZero(), "the provider's block %d carries no time: %s", height, body)
+	return res.Result.Block.Header.Time
 }
 
 // queryProviderConsumerChains queries the provider for registered consumer chains.

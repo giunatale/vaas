@@ -43,23 +43,38 @@ the consumer's owner (or governance) declares it through the optional
 `client_id` of `MsgUpdateConsumer`. The declaration is validated before it
 binds: the client must exist, be an active tendermint client of the consumer's
 registered chain id, hold a registered IBC v2 counterparty (an IBC v2 packet
-can only route over a counterparty-linked client), and its trusting period must
+can only route over a counterparty-linked client), its trusting period must
 exceed the downtime challenge horizon, so every accepted downtime accusation
-stays disprovable by a header the client can still verify. Until a valid
-declaration lands the provider sends nothing (fail closed -- the liveness sweep
-owns a consumer that never gets served). Once bound, the client is latched
-permanently: expiry, freezing, or counterparty loss halt traffic rather than
-reopening the binding.
+stays disprovable by a header the client can still verify, and that period plus
+the client's clock-drift allowance must fit within the provider's unbonding
+period, so a light-client pause can be resumed before the provider stops
+waiting for it. Registration
+already refuses an unbonding period whose trusting period at
+`trusting_period_fraction` would not clear that horizon, since no client of
+such a consumer could be declared. Until a valid declaration lands the
+provider sends nothing (fail closed -- the liveness sweep owns a consumer that
+never gets served). Once bound, the client is latched permanently: expiry,
+freezing, or counterparty loss halt traffic rather than reopening the binding.
 
 **Consumer side.** The mirror declaration. The consumer genesis creates no
 client and seeds two facts from the provider: the provider's chain id and the
-owner's address. `MsgSetProviderClient`, signed by that owner (or governance,
-where the embedding app wires it), pins the provider client once, under the
-symmetric validations (existing, tendermint, chain-id match against the seeded
-value, active, counterparty-linked). Every later packet must arrive over the
-pinned client or it is rejected before any state changes. Until the pin lands,
-a message filter keeps the chain in bootstrap: only IBC messages, governance,
-and the pin message itself are accepted.
+owner's address. `MsgSetProviderClient`, signed by that owner (or the chain's
+authority: governance where the embedding app wires it, the consumer module
+account acting for the owner on the reference consumer), pins the provider
+client once, under the symmetric validations (existing, tendermint, chain-id
+match against the seeded value, active, counterparty-linked). Every later
+packet must arrive over the pinned client or it is rejected before any state
+changes. The seeded chain id follows the pinned client: when that client,
+still active, tracks another chain id, the next packet (or owner exec) re-pins
+the stored id to it and emits `vaas_provider_chain_id_followed`, while a
+packet over any other client tracking another chain id stays refused. A
+tendermint client's chain id changes only through ibc-go's verified client
+upgrade (`MsgUpgradeClient`, which adopts the chain id the provider committed
+under its upgrade path) or a recovery by the chain's authority, and an owner
+exec may not leave the pinned client on another chain id, so a provider
+chain-id change needs nothing from the owner and the owner cannot bring one
+about. Until the pin lands, a message filter keeps the chain in bootstrap:
+only IBC messages, governance, and the pin message itself are accepted.
 
 Both bindings rest on the owner's signature rather than on anything inferred
 from delivered content, so no relayer, and no chain that merely copies the
@@ -67,9 +82,17 @@ chain-id string, can steer either side onto a client of its choosing. A
 dishonest owner can only mis-declare the consumer that owner registered.
 
 **Re-keying.** The only path to replace a dead client, on either side, is
-IBC's governance client recovery (`MsgRecoverClient`), which substitutes the
-client state under the same client id -- so the pin and the latch survive it.
-No automatic re-binding exists.
+IBC's client recovery by the chain's authority (`MsgRecoverClient`), which
+substitutes the client state under the same client id -- so the pin and the
+latch survive it. On the provider that authority is governance; on the
+reference consumer it is the consumer module account, which the consumer's
+owner acts as through `MsgOwnerExec` (see [embedding.md](embedding.md)). No
+automatic re-binding exists. A recovery, and ibc-go's permissionless client
+upgrade (`MsgUpgradeClient`, which takes the upgraded client state the
+consumer committed), can change the chain id the provider's client tracks; the
+provider then pauses the consumer until governance renames it to that chain id
+or recovers the client onto the consumer's (see
+[consumer-lifecycle.md](consumer-lifecycle.md#renaming-a-launched-consumer)).
 
 ## Infractions and punishment
 
@@ -92,9 +115,9 @@ BeginBlock, which pauses the consumer), the consumer is paused, VSC service
 stops, both evidence paths reject it, and its pending downtime accusations are
 cancelled with the fees withheld on their account repaid. Governance resumes
 the chain once the fork is understood and fixed, recovering the client in the
-same proposal and no sooner than one trusting period after the pause, since
-until then the same conflicting headers would pause the chain again, or lets
-the pause expire into `STOPPED` via `MaxPauseDuration`. See [equivocation-evidence.md](equivocation-evidence.md)
+same proposal and no sooner than one trusting period after the fork became
+known, since until then the same conflicting headers would pause the chain
+again, or lets the pause expire into `STOPPED` via `MaxPauseDuration`. See [equivocation-evidence.md](equivocation-evidence.md)
 and the design contract on `HandleConsumerMisbehaviour`.
 
 Provider-native equivocation is punished only if the embedding chain wires the
@@ -142,9 +165,11 @@ by a removal vote takes its evidence down with it
   downtime path will accuse it. The model gives the refuser two things. A
   public, stake-weighted signal (`MsgSetConsumerRefusal`): at
   `refusal_pause_threshold` (default one third, the share that halts the
-  chain physically anyway) the consumer is paused, which cancels its pending
-  accusations for everyone, and it stays paused until the coalition withdraws
-  or governance removes it. And deferral: downtime accusations start only
+  chain physically anyway) the consumer is paused, which freezes its pending
+  accusations for everyone (their clocks stop for the pause and restart on a
+  resume; only a proven challenge, a removal, or a lapsed pause decides them),
+  and it stays paused until the coalition withdraws or governance removes it.
+  And deferral: downtime accusations start only
   after the launch grace (`DowntimeGracePeriod`, default 7 days), every
   accepted accusation waits out the challenge window
   (`DowntimeChallengeWindow`, default 7 days), and one that matures while a
@@ -182,8 +207,12 @@ it. See [consumer-fee-pool.md](consumer-fee-pool.md).
   launched consumer that stops receiving VSC packets eventually enters safe mode,
   and one that goes silent is eventually stopped for liveness (see
   [consumer-liveness.md](consumer-liveness.md)).
-- **Consumer bootstrap window.** Client trust roots in the content commitment
-  (see the client-authentication model above); the chain-id gate is
-  defense-in-depth, not the trust root. The remaining assumption is the
-  consumer's trust-on-first-use window between chain start and the first
-  delivered VSC, after which the provider client is pinned for good.
+- **Consumer bootstrap.** There is no trust-on-first-use window: a new
+  consumer starts with no provider client pinned and rejects every VSC packet
+  until its owner (or governance) pins the relayer-created client with
+  `MsgSetProviderClient`, exactly once (see the client-authentication model
+  above); the chain-id gate seeded at genesis is defense-in-depth, not the
+  trust root. What remains is that the pin rests on the owner's signature, so
+  a dishonest owner can mis-declare the consumer it registered, and that
+  until the pin lands the consumer runs on its genesis validator set with its
+  message filter admitting bootstrap traffic only.

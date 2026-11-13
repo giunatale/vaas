@@ -2,10 +2,6 @@
 # targets that step into the app module keep resolving it.
 rundep=go run -modfile $(CURDIR)/devdeps/go.mod
 
-# Note: If you see "sonic only supports go1.17~1.23" warnings, either:
-# - Use Go 1.23: brew install go@1.23
-# - Or ignore it - the warning is harmless, sonic falls back to stdlib JSON
-
 ###############################################################################
 ###                               Build & Test                              ###
 ###############################################################################
@@ -13,10 +9,13 @@ rundep=go run -modfile $(CURDIR)/devdeps/go.mod
 build:
 	go build ./...
 
-# app/ is a separate Go module, so ./... in the root module does not reach it
+# app/ and tests/e2e/forge are Go modules of their own, so ./... in the root
+# module reaches neither. The e2e suites in tests/e2e need Docker and run
+# through test-e2e and test-e2e-forge.
 test:
 	go test -timeout=25m -v $(shell go list ./... | grep -v 'github.com/allinbits/vaas/tests/e2e')
 	cd app && go test -timeout=25m -v ./...
+	cd tests/e2e/forge && go test -timeout=25m -v ./...
 
 # The e2e suite and the apps are their own Go modules, so a run from the root
 # never sees them: each is linted from its own directory against the root
@@ -24,9 +23,10 @@ test:
 lint_cmd=$(rundep) github.com/golangci/golangci-lint/cmd/golangci-lint
 lint_e2e_cmd=cd tests/e2e && $(lint_cmd) run --config $(CURDIR)/.golangci.yml --tests=true
 lint_app_cmd=cd app && $(lint_cmd) run --config $(CURDIR)/.golangci.yml --tests=true
+lint_forge_cmd=cd tests/e2e/forge && $(lint_cmd) run --config $(CURDIR)/.golangci.yml --tests=true
 lint_fix_flags=--fix --out-format=tab --issues-exit-code=0
 
-lint: lint-e2e lint-app
+lint: lint-e2e lint-app lint-forge check-forge-replaces
 	$(lint_cmd) run ./...
 
 lint-e2e:
@@ -35,10 +35,31 @@ lint-e2e:
 lint-app:
 	$(lint_app_cmd) ./...
 
+# The e2e forge (tests/e2e/forge) is a module of its own, nested in tests/e2e.
+lint-forge:
+	$(lint_forge_cmd) ./...
+
+# The forge builds the reference consumer app under its own go.mod, so its
+# replace directives decide which atomone-sdk, cometbft and the rest the
+# forged node runs. They must be app/go.mod's, apart from the local paths to
+# this repository's modules.
+go_mod_replaces=awk '!/^[[:space:]]*\/\// && /=>/ { sub(/[[:space:]]*\/\/.*/, ""); sub(/^[[:space:]]*replace[[:space:]]+/, ""); $$1 = $$1; if ($$1 !~ /^github\.com\/allinbits\/vaas/) print }'
+
+check-forge-replaces:
+	@app=$$($(go_mod_replaces) app/go.mod | sort); \
+	forge=$$($(go_mod_replaces) tests/e2e/forge/go.mod | sort); \
+	if [ "$$app" != "$$forge" ]; then \
+		echo "tests/e2e/forge/go.mod's replace directives differ from app/go.mod's."; \
+		echo "app/go.mod:"; echo "$$app"; \
+		echo "tests/e2e/forge/go.mod:"; echo "$$forge"; \
+		exit 1; \
+	fi
+
 lint-fix:
 	$(lint_cmd) run $(lint_fix_flags) ./...
 	$(lint_e2e_cmd) $(lint_fix_flags) ./...
 	$(lint_app_cmd) $(lint_fix_flags) ./...
+	$(lint_forge_cmd) $(lint_fix_flags) ./...
 
 vulncheck:
 	$(rundep) golang.org/x/vuln/cmd/govulncheck ./...
@@ -47,11 +68,22 @@ vulncheck:
 mocks-gen:
 	$(rundep) go.uber.org/mock/mockgen -package=keeper -destination=testutil/keeper/mocks.go -source=x/vaas/types/expected_keepers.go
 
-# Run `go mod tidy` across every module in the workspace (root, app, devdeps, tests/e2e).
-tidy:
-	@bash ./scripts/go-mod-tidy-all.sh
+# Every Go module in the repository.
+go_modules=. app tests/e2e tests/e2e/forge devdeps
 
-.PHONY: build test lint lint-fix vulncheck mocks-gen tidy
+tidy:
+	@for m in $(go_modules); do echo "go mod tidy in $$m"; (cd $$m && go mod tidy) || exit 1; done
+
+# Fail, printing go mod tidy's diff, when a module's go.mod or go.sum is not
+# what make tidy would write.
+check-tidy:
+	@untidy=""; \
+	for m in $(go_modules); do \
+		(cd $$m && go mod tidy -diff) || untidy="$$untidy $$m"; \
+	done; \
+	if [ -n "$$untidy" ]; then echo "modules not tidy (run make tidy):$$untidy"; exit 1; fi
+
+.PHONY: build test lint lint-fix vulncheck mocks-gen tidy check-tidy
 
 ###############################################################################
 ###                                Protobuf                                 ###
@@ -59,16 +91,19 @@ tidy:
 
 containerProtoVer=0.14.0
 containerProtoImage=ghcr.io/cosmos/proto-builder:$(containerProtoVer)
+# protoImage runs a command at the repository root; protoDirImage runs it from
+# proto/, where buf.yaml lives, as buf lint and clang-format expect.
 protoImage=docker run --rm -v $(CURDIR):/workspace --workdir /workspace $(containerProtoImage)
+protoDirImage=docker run --rm -v $(CURDIR):/workspace --workdir /workspace/proto $(containerProtoImage)
 
 proto-gen:
 	$(protoImage) sh ./scripts/protocgen.sh
 
 proto-format:
-	$(protoImage) find ./ -name "*.proto" -exec clang-format -i {} \;
+	$(protoDirImage) find ./ -name "*.proto" -exec clang-format -i {} \;
 
 proto-lint:
-	$(protoImage) buf lint --error-format=json
+	$(protoDirImage) buf lint --error-format=json
 
 proto-update-deps:
 	$(protoImage) buf mod update proto/
@@ -82,18 +117,40 @@ BUILDDIR ?= $(CURDIR)/build
 provider_home=~/.provider-localnet
 providerd=./build/provider --home $(provider_home)
 
+# Version information linked into both binaries (`provider version --long`).
+VERSION ?= $(shell git describe --tags --always --dirty)
+COMMIT ?= $(shell git rev-parse HEAD)
 
-GO_REQUIRED_VERSION = $(shell go list -f {{.GoVersion}} -m)
+# MIN_VOTING_PERIOD lowers the governance voting-period floor that atomone-sdk
+# links into the binary (504h). Empty keeps the floor; a network whose voting
+# period is below it must build with the variable set, for example
+# `make build-apps MIN_VOTING_PERIOD=30s` (see app/README.md).
+MIN_VOTING_PERIOD ?=
+
+ldflags = -X github.com/cosmos/cosmos-sdk/version.Name=vaas \
+	-X github.com/cosmos/cosmos-sdk/version.Version=$(VERSION) \
+	-X github.com/cosmos/cosmos-sdk/version.Commit=$(COMMIT) \
+	$(if $(MIN_VOTING_PERIOD),-X github.com/cosmos/cosmos-sdk/x/gov/types/v1.MinVotingPeriod=$(MIN_VOTING_PERIOD))
+
+apps := provider consumer
 BUILD_TARGETS := build-apps install-apps
 build-apps: BUILD_ARGS=-o $(BUILDDIR)/
 
+# One go invocation per binary, so each carries its own version.AppName.
 $(BUILD_TARGETS): go.sum $(BUILDDIR)/
-	@cd app; go $(patsubst %-apps,%,$@) -mod=readonly $(BUILD_ARGS) ./...
+	@for app in $(apps); do \
+		(cd app && go $(patsubst %-apps,%,$@) -mod=readonly $(BUILD_ARGS) \
+			-ldflags "$(ldflags) -X github.com/cosmos/cosmos-sdk/version.AppName=$$app" ./cmd/$$app) || exit 1; \
+	done
 
 $(BUILDDIR)/:
 	mkdir -p $(BUILDDIR)/
 
-.PHONY: build-apps install-apps
+.PHONY: build-apps install-apps provider-start
+
+# The localnet runs governance with a 300s voting period, below the floor
+# atomone-sdk links into the binary, so its builds lower the floor to match.
+provider-start localnet-start: MIN_VOTING_PERIOD = 300s
 
 provider-start: build-apps
 	rm -rf $(provider_home)
@@ -119,11 +176,14 @@ provider-start: build-apps
 	sed -i.bak 's#tcp://127.0.0.1:26657#tcp://0.0.0.0:26657#g' $(provider_home)/config/config.toml
 	# enable REST API
 	$(providerd) config set app api.enable true
-	# Decrease voting period to 5min
-	jq '.app_state.gov.params.voting_period = "300s"' $(provider_home)/config/genesis.json > /tmp/gen
+	# Governance with a 300s voting period. The gov fields atomone-sdk bounds
+	# by the voting period move with it: quorum_timeout stays below it,
+	# max_voting_period_extension and both deposit throttlers' update_period
+	# stay at most equal to it (see app/README.md).
+	jq '.app_state.gov.params |= (.voting_period = "300s" | .quorum_timeout = "0s" | .max_voting_period_extension = "300s" | .min_deposit_throttler.update_period = "300s" | .min_initial_deposit_throttler.update_period = "300s")' $(provider_home)/config/genesis.json > /tmp/gen
 	mv /tmp/gen $(provider_home)/config/genesis.json
 
-	# Decrease number of blocks per epoch (VAAS provider VCS update)
+	# Decrease number of blocks per epoch (VAAS provider VSC packets)
 	jq '.app_state.vaasprovider.params.blocks_per_epoch = "10"' $(provider_home)/config/genesis.json > /tmp/gen
 	mv /tmp/gen $(provider_home)/config/genesis.json
 
@@ -211,14 +271,15 @@ consumer-start: consumer-init consumer-create
 # the consumer stays out of debt. The fee denom is uphoton (fixed at module
 # wiring); FEE_POOL_AMOUNT must clear the min-deposit floor
 # (fees_per_block_amount x min_deposit_blocks). Run after the consumer exists,
-# e.g. make provider-fund-consumer-fee-pool CONSUMER_ID=0
+# e.g. make provider-fund-consumer-fee-pool CONSUMER_ID=0; localnet-start runs
+# it once the clients are declared.
 FEE_POOL_AMOUNT ?= 100000000uphoton
 provider-fund-consumer-fee-pool:
 	$(providerd) tx vaasprovider fund-consumer-fee-pool $(CONSUMER_ID) $(FEE_POOL_AMOUNT) \
 		--from val --keyring-backend test --chain-id provider-localnet \
 		--gas auto --gas-adjustment 1.5 --fees 10000uatone -y
 
-.PHONY: consumer-init consumer-create consumer-genesis consumer-run consumer-start provider-fund-consumer-fee-pool
+.PHONY: consumer-init consumer-create consumer-genesis consumer-copy-val-key consumer-run consumer-start provider-fund-consumer-fee-pool
 
 ###############################################################################
 ###                               TS Relayer                                ###
@@ -282,7 +343,7 @@ localnet-clean:
 localnet-start: build-apps
 	@echo "=== Starting VAAS Localnet ==="
 	@echo ""
-	@echo "Step 1/4: Starting provider chain in background..."
+	@echo "Step 1/5: Starting provider chain in background..."
 	@$(MAKE) provider-start > /tmp/vaas-provider.log 2>&1 &
 	@echo "  Waiting for provider to produce blocks..."
 	@for i in $$(seq 1 60); do \
@@ -298,7 +359,7 @@ localnet-start: build-apps
 		sleep 2; \
 	done
 	@echo ""
-	@echo "Step 2/4: Starting consumer chain in background..."
+	@echo "Step 2/5: Starting consumer chain in background..."
 	@$(MAKE) consumer-start > /tmp/vaas-consumer.log 2>&1 &
 	@echo "  Waiting for consumer to produce blocks..."
 	@for i in $$(seq 1 90); do \
@@ -314,23 +375,27 @@ localnet-start: build-apps
 		sleep 2; \
 	done
 	@echo ""
-	@echo "Step 3/4: Starting ts-relayer..."
+	@echo "Step 3/5: Starting ts-relayer..."
 	@$(MAKE) ts-relayer-start > /tmp/vaas-ts-relayer.log 2>&1
 	@echo ""
-	@echo "Step 3b/4: Declaring the relayer-created IBC clients (owner, both chains)..."
+	@echo "Step 3b/5: Declaring the relayer-created IBC clients (owner, both chains)..."
 	@$(MAKE) localnet-declare-clients
 	@echo ""
-	@echo "Step 4/4: Triggering valset change to send first VSC packet..."
+	@echo "Step 4/5: Funding the consumer fee pool..."
+	@$(MAKE) provider-fund-consumer-fee-pool CONSUMER_ID=0 > /dev/null
+	@echo "  Fee pool funded with $(FEE_POOL_AMOUNT) from val; the next epoch collection clears the debt flagged while the pool was empty."
+	@echo ""
+	@echo "Step 5/5: Triggering valset change to send the first VSC packet..."
 	@VALOPER=$$($(providerd) keys show val --bech val -a 2> /dev/null); \
 	$(providerd) tx staking delegate $$VALOPER 1000000uatone --from user --fees 5000uatone -y > /dev/null 2>&1
-	@echo "  Delegation sent. Waiting for VSC packet to be relayed..."
+	@echo "  Delegation sent; the VSC packet goes out at the next epoch boundary. Checking the consumer reports its provider client..."
 	@for i in $$(seq 1 60); do \
 		if $(consumerd) query vaasconsumer provider-info --node tcp://localhost:26667 > /dev/null 2>&1; then \
-			echo "  Channel established! (after $$((i*2))s)"; \
+			echo "  Consumer reports its provider client (after $$((i*2))s)"; \
 			break; \
 		fi; \
 		if [ $$i -eq 60 ]; then \
-			echo "  WARNING: VSC packet not relayed within 120s. The channel may need more time."; \
+			echo "  WARNING: the consumer did not report its provider client within 120s; check /tmp/vaas-consumer.log"; \
 			break; \
 		fi; \
 		sleep 2; \
@@ -346,8 +411,9 @@ localnet-start: build-apps
 
 # Declare the relayer-created IBC clients on both chains (owner-signed, once).
 # The provider learns its consumer client via update-consumer, the consumer
-# pins its provider client via set-provider-client; until both land, VSC
-# packets stay queued on the provider and rejected by the consumer.
+# pins its provider client via set-provider-client. Until the provider-side
+# declaration lands, VSC packets stay queued on the provider; until the
+# consumer's pin lands, the consumer rejects every packet that arrives.
 localnet-declare-clients:
 	@echo "  Waiting for the relayer-created clients..."
 	@for i in $$(seq 1 60); do \
@@ -380,9 +446,55 @@ docker-build-debug:
 # Build all Docker images needed for e2e tests
 docker-build-all: docker-build-debug
 
-# Run the e2e integration test suite
-test-e2e: docker-build-all
-	@echo "Running e2e tests..."
-	cd tests/e2e && go test -timeout=60m -v ./... --count=1
+# Run every e2e suite but the byzantine-consumer one, one at a time, each
+# through test-e2e-suite and under its timeout. The suites are the top-level
+# Test*Suite functions; a failed one does not stop the others, and the run
+# fails if any did. The byzantine-consumer suite needs the forge image, which
+# this target does not build: it runs only through test-e2e-forge.
+test-e2e:
+	@suites=$$(cd tests/e2e && go test -list '^Test.*Suite$$' ./... | grep '^Test' | grep -vx '$(forge_suite)') || \
+		{ echo "no e2e suite found in tests/e2e"; exit 1; }; \
+	failed=""; \
+	for suite in $$suites; do \
+		$(MAKE) --no-print-directory test-e2e-suite SUITE=$$suite || failed="$$failed $$suite"; \
+	done; \
+	if [ -n "$$failed" ]; then echo "failed e2e suites:$$failed"; exit 1; fi
 
-.PHONY: docker-build-debug docker-build-all test-e2e
+# Run one e2e suite by its top-level test name, as CI does per job:
+#   make test-e2e-suite SUITE=TestLivenessIntegrationTestSuite
+test-e2e-suite: require-suite docker-build-all
+	@echo "Running e2e suite $(SUITE)..."
+	cd tests/e2e && go test -timeout=60m -v -run '^$(SUITE)$$' ./... --count=1
+
+# go test exits 0 when -run matches no test, so an empty, misspelled or
+# missing SUITE would pass without running anything; refuse it before
+# building anything.
+require-suite:
+	$(if $(SUITE),,$(error SUITE is required, e.g. make test-e2e-suite SUITE=TestIntegrationTestSuite))
+	@cd tests/e2e && go test -list '^$(SUITE)$$' ./... | grep -qx '$(SUITE)' || \
+		{ echo "no e2e suite named $(SUITE) in tests/e2e"; exit 1; }
+
+# Every e2e suite needs a job in the CI workflow's e2e matrix, or CI never
+# runs it; the byzantine-consumer suite runs in the forge workflow instead.
+check-e2e-matrix:
+	@suites=$$(sed -n 's/^func \(Test[A-Za-z0-9_]*Suite\)(t \*testing\.T).*/\1/p' tests/e2e/*_test.go | grep -vx '$(forge_suite)'); \
+	if [ -z "$$suites" ]; then echo "no e2e suite found in tests/e2e"; exit 1; fi; \
+	missing=""; \
+	for suite in $$suites; do \
+		grep -Eq "^[[:space:]]+- $$suite$$" .github/workflows/ci.yml || missing="$$missing $$suite"; \
+	done; \
+	if [ -n "$$missing" ]; then echo "e2e suites missing from the e2e matrix in .github/workflows/ci.yml:$$missing"; exit 1; fi
+
+# The byzantine-consumer suite runs a deliberately lying consumer node built
+# only into its own image (see tests/e2e/forge); only its workflow builds it.
+forge_suite=TestByzantineConsumerIntegrationTestSuite
+
+docker-build-forge: docker-build-all
+	@echo "Building VAAS e2e forge image..."
+	docker build -t cosmos/vaas-e2e-forge -f tests/e2e/forge/Dockerfile .
+
+test-e2e-forge: docker-build-forge
+	@echo "Running the byzantine-consumer e2e suite..."
+	cd tests/e2e && go test -timeout=60m -v -run '^$(forge_suite)$$' ./... --count=1
+
+.PHONY: docker-build-debug docker-build-all test-e2e test-e2e-suite require-suite check-e2e-matrix docker-build-forge test-e2e-forge check-forge-replaces

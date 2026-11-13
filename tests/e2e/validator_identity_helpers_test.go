@@ -16,12 +16,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	cmted25519 "github.com/cometbft/cometbft/crypto/ed25519"
+
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/bech32"
 )
 
 // parseInt64 parses a decimal string field from a JSON query response.
@@ -36,36 +41,103 @@ func parseInt64(t *testing.T, s string) int64 {
 
 // consAddrFromEd25519PubKey derives a validator's consensus address from its
 // ed25519 public key, exactly as CometBFT does (first 20 bytes of the SHA256
-// digest), and returns it bech32-encoded. Both apps configure the default
-// "cosmos" bech32 prefixes (see app/cmd/{provider,consumer}/main.go), which
-// this test binary also uses, so the encoding matches what the chains accept
-// and print.
+// digest), and returns it bech32-encoded under this test binary's "cosmos"
+// prefix, which is the provider's (see app/cmd/provider/main.go). The
+// consumer runs under consumerBech32Prefix; what is read from it is
+// re-encoded before it is compared with these.
 func consAddrFromEd25519PubKey(pubKey []byte) string {
 	digest := sha256.Sum256(pubKey)
 	return sdk.ConsAddress(digest[:20]).String()
 }
 
+// ed25519PubKeyJSON renders a raw ed25519 public key as the inline Cosmos SDK
+// Any-JSON pubkey blob the key-taking commands expect (`tx vaasprovider
+// assign-consensus-key`, `tx staking rotate-cons-pubkey`, a create-validator
+// payload).
+func ed25519PubKeyJSON(pub []byte) string {
+	return fmt.Sprintf(`{"@type":"/cosmos.crypto.ed25519.PubKey","key":%q}`,
+		base64.StdEncoding.EncodeToString(pub))
+}
+
+// nodeConsensusKey reads the ed25519 key pair a node signs with from the
+// priv_validator_key.json in its home: the raw public key, and the private
+// key in the 64-byte form CometBFT's ed25519 type signs with.
+func nodeConsensusKey(t *testing.T, home string) (pub []byte, priv cmted25519.PrivKey) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(home, "config", "priv_validator_key.json"))
+	if err != nil {
+		t.Fatalf("failed to read the consensus key in %s: %v", home, err)
+	}
+	var keyFile struct {
+		PubKey struct {
+			Value string `json:"value"`
+		} `json:"pub_key"`
+		PrivKey struct {
+			Value string `json:"value"`
+		} `json:"priv_key"`
+	}
+	if err := json.Unmarshal(raw, &keyFile); err != nil {
+		t.Fatalf("failed to decode the consensus key in %s: %v", home, err)
+	}
+	pub, err = base64.StdEncoding.DecodeString(keyFile.PubKey.Value)
+	if err != nil {
+		t.Fatalf("failed to decode the public key in %s: %v", home, err)
+	}
+	privBytes, err := base64.StdEncoding.DecodeString(keyFile.PrivKey.Value)
+	if err != nil {
+		t.Fatalf("failed to decode the private key in %s: %v", home, err)
+	}
+	return pub, cmted25519.PrivKey(privBytes)
+}
+
 // generateConsumerConsensusKey generates a fresh ed25519 keypair and returns
 // the public half as an inline Cosmos SDK Any-JSON pubkey blob (the format
 // `tx provider assign-consensus-key` expects) together with the consensus
-// address it derives. The private half is discarded: the key is only ever
-// assigned to a validator that runs no consumer node (see
+// address it derives. The private half is discarded: the key is assigned to
+// a validator that runs no consumer node under it (see
 // e2e_key_assignment_test.go), so nothing needs to sign with it.
 func generateConsumerConsensusKey(t *testing.T) (pubKeyJSON, consAddr string) {
 	t.Helper()
-	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	pubKeyJSON, consAddr, _ = generateConsumerConsensusKeyPair(t)
+	return pubKeyJSON, consAddr
+}
+
+// generateConsumerConsensusKeyPair is generateConsumerConsensusKey keeping
+// the private half: besides the assignable pubkey blob and the consensus
+// address, it returns the priv_validator_key.json document a node runs under
+// to sign with the key (see e2e_multival_key_assignment_test.go and
+// e2e_multival_cons_key_rotation_test.go).
+func generateConsumerConsensusKeyPair(t *testing.T) (pubKeyJSON, consAddr string, privValidatorKeyJSON []byte) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("failed to generate ed25519 key: %v", err)
 	}
-	pubKeyJSON = fmt.Sprintf(`{"@type":"/cosmos.crypto.ed25519.PubKey","key":%q}`,
-		base64.StdEncoding.EncodeToString(pub))
-	return pubKeyJSON, consAddrFromEd25519PubKey(pub)
+	pubKeyJSON = ed25519PubKeyJSON(pub)
+	digest := sha256.Sum256(pub)
+	privValidatorKeyJSON, err = json.Marshal(map[string]any{
+		"address": strings.ToUpper(hex.EncodeToString(digest[:20])),
+		"pub_key": map[string]string{
+			"type":  "tendermint/PubKeyEd25519",
+			"value": base64.StdEncoding.EncodeToString(pub),
+		},
+		"priv_key": map[string]string{
+			"type":  "tendermint/PrivKeyEd25519",
+			"value": base64.StdEncoding.EncodeToString(priv),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to encode priv_validator_key.json: %v", err)
+	}
+	return pubKeyJSON, consAddrFromEd25519PubKey(pub), privValidatorKeyJSON
 }
 
 // consAddrToCometHex converts a bech32 consensus address to the uppercase hex
-// form CometBFT's /validators RPC reports.
+// form CometBFT's /validators RPC reports. It accepts any prefix: the provider
+// and the consumer run under different ones, and this test binary's own
+// configuration matches only the provider's.
 func consAddrToCometHex(bech32ConsAddr string) (string, error) {
-	addr, err := sdk.ConsAddressFromBech32(bech32ConsAddr)
+	_, addr, err := bech32.DecodeAndConvert(bech32ConsAddr)
 	if err != nil {
 		return "", fmt.Errorf("decoding consensus address %q: %w", bech32ConsAddr, err)
 	}
@@ -83,10 +155,35 @@ func consAddrFromBase64(b64 string) (string, error) {
 	return sdk.ConsAddress(raw).String(), nil
 }
 
+// tryStakingValidatorState is stakingValidatorState returning an error
+// instead of failing the test, for the conditions of Eventually and Never,
+// which run in a goroutine of their own: a failure there stalls the wait to
+// its timeout.
+func (s *baseTestSuite) tryStakingValidatorState(valoper string) (jailed bool, tokens string, err error) {
+	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
+		providerBinary, "query", "staking", "validator", valoper,
+		"--home", providerHomePath,
+		"--output", "json",
+	})
+	if err != nil {
+		return false, "", fmt.Errorf("querying staking validator %s: %w (stderr=%s)", valoper, err, stderr.String())
+	}
+	var res struct {
+		Validator struct {
+			Jailed bool   `json:"jailed"`
+			Tokens string `json:"tokens"`
+		} `json:"validator"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		return false, "", fmt.Errorf("decoding staking validator %s: %w (raw=%s)", valoper, err, stdout.String())
+	}
+	return res.Validator.Jailed, res.Validator.Tokens, nil
+}
+
 // providerValidatorConsAddr returns the bech32 consensus address of the
 // provider validator with the given operator address, failing the test if it
 // cannot be resolved.
-func (s *IntegrationTestSuite) providerValidatorConsAddr(valoperAddr string) string {
+func (s *baseTestSuite) providerValidatorConsAddr(valoperAddr string) string {
 	consAddr, err := s.tryProviderValidatorConsAddr(valoperAddr)
 	s.Require().NoErrorf(err, "failed to resolve the consensus address of validator %s", valoperAddr)
 	return consAddr
@@ -96,7 +193,7 @@ func (s *IntegrationTestSuite) providerValidatorConsAddr(valoperAddr string) str
 // address from the consensus pubkey the staking module stores for it. It
 // returns an error instead of failing the test so it can be called from inside
 // an Eventually condition.
-func (s *IntegrationTestSuite) tryProviderValidatorConsAddr(valoperAddr string) (string, error) {
+func (s *baseTestSuite) tryProviderValidatorConsAddr(valoperAddr string) (string, error) {
 	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
 		providerBinary, "query", "staking", "validator", valoperAddr,
 		"--home", providerHomePath,
@@ -150,7 +247,7 @@ func (s *IntegrationTestSuite) tryProviderValidatorConsAddr(valoperAddr string) 
 
 // providerValoperForConsAddr returns the operator address of the provider
 // validator whose consensus address is consAddr, or "" when none matches.
-func (s *IntegrationTestSuite) providerValoperForConsAddr(consAddr string) string {
+func (s *baseTestSuite) providerValoperForConsAddr(consAddr string) string {
 	vals, err := s.queryProviderValidators()
 	if err != nil {
 		return ""
@@ -166,7 +263,7 @@ func (s *IntegrationTestSuite) providerValoperForConsAddr(consAddr string) strin
 
 // consumerValsetConsAddrs returns the bech32 consensus addresses of the
 // consumer chain's current CometBFT validator set.
-func (s *IntegrationTestSuite) consumerValsetConsAddrs() ([]string, error) {
+func (s *baseTestSuite) consumerValsetConsAddrs() ([]string, error) {
 	vals, err := s.queryConsumerNetValidators()
 	if err != nil {
 		return nil, err
@@ -181,7 +278,7 @@ func (s *IntegrationTestSuite) consumerValsetConsAddrs() ([]string, error) {
 // consumerValidatorHexAddrsAtHeight returns the consumer chain's validator set
 // at a past height as uppercase hex addresses, read from the consumer's own
 // CometBFT RPC (the same source a challenger's tooling reads).
-func (s *IntegrationTestSuite) consumerValidatorHexAddrsAtHeight(height int64) ([]string, error) {
+func (s *baseTestSuite) consumerValidatorHexAddrsAtHeight(height int64) ([]string, error) {
 	body, err := httpGet(fmt.Sprintf("%s/validators?height=%d&per_page=100", s.consumerRPCEndpoint(), height))
 	if err != nil {
 		return nil, err
@@ -205,7 +302,7 @@ func (s *IntegrationTestSuite) consumerValidatorHexAddrsAtHeight(height int64) (
 
 // consumerBlockValidatorHashes returns the validators_hash and
 // next_validators_hash of the consumer's block at the given height.
-func (s *IntegrationTestSuite) consumerBlockValidatorHashes(height int64) (valsHash, nextValsHash string, err error) {
+func (s *baseTestSuite) consumerBlockValidatorHashes(height int64) (valsHash, nextValsHash string, err error) {
 	body, err := httpGet(fmt.Sprintf("%s/block?height=%d", s.consumerRPCEndpoint(), height))
 	if err != nil {
 		return "", "", err

@@ -27,7 +27,6 @@ import (
 )
 
 var (
-	_ module.AppModule           = (*AppModule)(nil)
 	_ module.AppModuleBasic      = (*AppModuleBasic)(nil)
 	_ module.AppModuleSimulation = (*AppModule)(nil)
 	_ module.HasABCIGenesis      = (*AppModule)(nil)
@@ -122,7 +121,7 @@ func (AppModule) RegisterInvariants(_ sdk.InvariantRegistry) {}
 func (am AppModule) RegisterServices(cfg module.Configurator) {
 	consumertypes.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(&am.keeper))
 	consumertypes.RegisterQueryServer(cfg.QueryServer(), am.keeper)
-	// Register staking query server so Hermes can query staking params for IBC client creation
+	// Register the staking query server so IBC relayers can read the unbonding time when creating a client of this chain
 	stakingtypes.RegisterQueryServer(cfg.QueryServer(), keeper.NewStakingQueryServer(&am.keeper))
 	// Note: Migrations are not registered as this is a fresh module start
 }

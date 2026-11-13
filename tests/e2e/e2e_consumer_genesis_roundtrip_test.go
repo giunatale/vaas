@@ -75,10 +75,10 @@ func (s *IntegrationTestSuite) testConsumerGenesisRoundTrip() {
 			s.waitForChainHeight(quiesceCtx, "http://localhost:"+s.cfg.consumerRPCPort, preHeight+3),
 			"consumer did not commit blocks after the relayer pause")
 
-		// 2. Stop the consumer container gracefully so the data dir is in a
+		// 2. Stop the consumer node gracefully so the data dir is in a
 		//    consistent state for export.
 		s.T().Log("stopping consumer container for export...")
-		s.Require().NoError(s.dkrPool.Client.StopContainer(oldRes.Container.ID, 30))
+		s.stopConsumerNode(0)
 
 		// 3. With the container stopped and its recv traffic drained, the log
 		//    is final: the highest vscID the consumer ever applied is the
@@ -121,6 +121,10 @@ func (s *IntegrationTestSuite) testConsumerGenesisRoundTrip() {
 		s.T().Log("bootstrapping new consumer data dir from exported genesis...")
 		newDataDir := s.bootstrapRestartedConsumerDir(oldDataDir, exportedJSON)
 
+		// 6b. The runbook's gate, on the consumer's export too.
+		s.T().Log("validating the exported consumer genesis...")
+		s.validateGenesisInContainer(ctx, consumerBinary, consumerHomePath, newDataDir)
+
 		// 7. Purge the old container so its name and port bindings are freed
 		//    for the replacement (the relayer reaches the consumer by
 		//    container name, so the replacement must reuse it).
@@ -131,7 +135,7 @@ func (s *IntegrationTestSuite) testConsumerGenesisRoundTrip() {
 		// 8. Start a new consumer container from the new data dir on the same
 		//    name and ports the old container used.
 		s.T().Log("starting restarted consumer container...")
-		newRes := s.startRestartedConsumer(newDataDir)
+		newRes := s.startRestartedConsumerNode(0, newDataDir)
 		s.consumerValRes = append(s.consumerValRes, newRes)
 
 		// 9. Wait for the new consumer to produce blocks past the continuing
@@ -269,7 +273,7 @@ func appliedVscIDs(logs string) []uint64 {
 // valPowerMap flattens a consensus valset query result into a
 // pubkey(base64) -> voting power map, the address-independent form the
 // round-trip assertions compare.
-func (s *IntegrationTestSuite) valPowerMap(vals []*cmtservice.Validator) map[string]uint64 {
+func (s *baseTestSuite) valPowerMap(vals []*cmtservice.Validator) map[string]uint64 {
 	keys, powers := s.extractPubKeys(vals)
 	m := make(map[string]uint64, len(keys))
 	for i, k := range keys {
@@ -283,7 +287,7 @@ func (s *IntegrationTestSuite) valPowerMap(vals []*cmtservice.Validator) map[str
 // provider-side set can be compared against a consumer-side one after
 // rewriting assigned consumer keys through the provider's key-assignment
 // pairs.
-func (s *IntegrationTestSuite) valAddrPowerMap(vals []*cmtservice.Validator) map[string]int64 {
+func (s *baseTestSuite) valAddrPowerMap(vals []*cmtservice.Validator) map[string]int64 {
 	m := make(map[string]int64, len(vals))
 	for _, v := range vals {
 		m[v.Address] = v.VotingPower
@@ -294,7 +298,7 @@ func (s *IntegrationTestSuite) valAddrPowerMap(vals []*cmtservice.Validator) map
 // queryAllPairsValConsAddr returns the provider-to-consumer consensus address
 // pairs the provider tracks for a consumer, keyed by provider address. A
 // validator with no assigned consumer key has no pair.
-func (s *IntegrationTestSuite) queryAllPairsValConsAddr(consumerID string) map[string]string {
+func (s *baseTestSuite) queryAllPairsValConsAddr(consumerID string) map[string]string {
 	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
 		providerBinary, "query", "vaasprovider", "all-pairs-valconsensus-address", consumerID,
 		"--home", providerHomePath,
@@ -331,13 +335,17 @@ func powerSum(set map[string]uint64) uint64 {
 // consumer's data directory and runs `consumer export` (without
 // --for-zero-height: the restarted chain continues at the next height).
 // Returns the exported genesis JSON.
-func (s *IntegrationTestSuite) exportConsumerGenesis(ctx context.Context, dataDir string) []byte {
+func (s *baseTestSuite) exportConsumerGenesis(ctx context.Context, dataDir string) []byte {
 	exportRes, err := s.dkrPool.RunWithOptions(
 		&dockertest.RunOptions{
-			Name:       fmt.Sprintf("%s-export", consumerChainID),
+			Name:       fmt.Sprintf("%s-export", s.cfg.consumerChainID),
 			Repository: e2eChainImage,
 			NetworkID:  s.dkrNet.Network.ID,
 			User:       "nonroot",
+			// The export renders addresses under the running prefix, and the
+			// restarted node reads them back under its own: both must be the
+			// consumer's (see consumerBech32Prefix).
+			Env: []string{"VAAS_BECH32_PREFIX=" + consumerBech32Prefix},
 			Mounts: []string{
 				fmt.Sprintf("%s:%s", dataDir, consumerHomePath),
 			},
@@ -461,8 +469,8 @@ func (s *IntegrationTestSuite) verifyExportedConsumerGenesis(exportedJSON []byte
 // bootstrapRestartedConsumerDir builds a new consumer data directory that
 // reuses the old chain's validator and node keys + config files, but uses
 // the exported JSON as its genesis.json and starts with an empty data/.
-func (s *IntegrationTestSuite) bootstrapRestartedConsumerDir(oldDir string, exportedJSON []byte) string {
-	newDir, err := os.MkdirTemp("", "vaas-e2e-consumer-restart-")
+func (s *baseTestSuite) bootstrapRestartedConsumerDir(oldDir string, exportedJSON []byte) string {
+	newDir, err := os.MkdirTemp("", s.cfg.tmpDirPrefix+"consumer-restart-")
 	s.Require().NoError(err)
 	s.tmpDirs = append(s.tmpDirs, newDir)
 	s.Require().NoError(os.Chmod(newDir, 0o777))
@@ -502,33 +510,15 @@ func (s *IntegrationTestSuite) bootstrapRestartedConsumerDir(oldDir string, expo
 	return newDir
 }
 
-// startRestartedConsumer runs a new consumer container on the same name and
-// host ports the original used (the relayer reaches the consumer by container
-// name), mounting the new data dir.
-func (s *IntegrationTestSuite) startRestartedConsumer(dataDir string) *dockertest.Resource {
+// startRestartedConsumerNode runs a new container for consumer node index on
+// the same name and host ports the original used (the relayer reaches the
+// consumer by container name), mounting the new data dir.
+func (s *baseTestSuite) startRestartedConsumerNode(index int, dataDir string) *dockertest.Resource {
 	// Update so subsequent helpers find the new data dir.
-	s.consumer.dataDir = dataDir
+	s.consumer.homes[index] = dataDir
+	if index == 0 {
+		s.consumer.dataDir = dataDir
+	}
 
-	resource, err := s.dkrPool.RunWithOptions(
-		&dockertest.RunOptions{
-			Name:       fmt.Sprintf("%s-val0", consumerChainID),
-			Repository: e2eChainImage,
-			NetworkID:  s.dkrNet.Network.ID,
-			Mounts: []string{
-				fmt.Sprintf("%s:%s", dataDir, consumerHomePath),
-			},
-			PortBindings: map[docker.Port][]docker.PortBinding{
-				"26657/tcp": {{HostIP: "", HostPort: s.cfg.consumerRPCPort}},
-				"9090/tcp":  {{HostIP: "", HostPort: s.cfg.consumerGRPCPort}},
-				"1317/tcp":  {{HostIP: "", HostPort: s.cfg.consumerRESTPort}},
-				"26656/tcp": {{HostIP: "", HostPort: s.cfg.consumerP2PPort}},
-			},
-			Cmd: []string{consumerBinary, "start", "--home", consumerHomePath},
-		},
-		func(config *docker.HostConfig) {
-			config.RestartPolicy = docker.RestartPolicy{Name: "no"}
-		},
-	)
-	s.Require().NoError(err, "failed to start restarted consumer container")
-	return resource
+	return s.startChainNode(s.cfg.consumerChainID, consumerBinary, consumerHomePath, dataDir, index, s.consumerPorts())
 }

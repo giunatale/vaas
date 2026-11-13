@@ -89,7 +89,7 @@ func (s *IntegrationTestSuite) SetupSuite() {
 			// A fast voting period, still wide enough for the deferral tests
 			// to land a removal proposal inside it with room to spare on both
 			// sides of the punishment maturity they time it over.
-			s.genesisSection(appState, "gov", "params")["voting_period"] = "30s"
+			s.setGovVotingPeriod(appState)
 
 			// Set fast epoch for VSC and a small per-block fee amount. The fee
 			// denom is fixed to feeDenom at module wiring, only the amount is
@@ -200,8 +200,24 @@ func (s *IntegrationTestSuite) SetupSuite() {
 	s.T().Log("step 5: starting ts-relayer and creating IBC v2 path...")
 	s.setupTSRelayer()
 
+	// The photon policy and the node fee floor exempt bootstrap traffic only
+	// until the provider client is pinned; after that the relayer pays the
+	// consumer in the voucher denom like everyone else. The vouchers it pays
+	// with, and the owner's, reach the consumer now, over the freshly
+	// created client, while the deliveries are still free.
+	var voucherDenom string
+	if s.cfg.enableConsumerPhotonFees {
+		s.T().Log("step 5a: funding the relayer and the owner with photon vouchers before the pin...")
+		voucherDenom = s.fundPhotonFeePayersBeforePin()
+	}
+
 	s.T().Log("step 5b: declaring the relayer-created clients (owner, both chains)...")
 	s.declareConsumerClients("0")
+
+	if s.cfg.enableConsumerPhotonFees {
+		s.T().Log("step 5c: switching the relayer to voucher fees now that the pin is routable...")
+		s.switchTSRelayerToVoucherFees(voucherDenom)
+	}
 
 	s.T().Log("step 6: checking IBC counterparty registration...")
 	s.collectIBCDiagnosticsLog()

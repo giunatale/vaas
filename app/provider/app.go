@@ -123,28 +123,10 @@ var (
 	// DefaultNodeHome default home directories for the application daemon
 	DefaultNodeHome string
 
-	// ModuleBasics defines the module BasicManager is in charge of setting up basic,
-	// non-dependant module elements, such as codec registration
-	// and genesis verification.
-	ModuleBasics = module.NewBasicManager(
-		genutil.NewAppModuleBasic(genutiltypes.DefaultMessageValidator),
-		auth.AppModuleBasic{},
-		vesting.AppModuleBasic{},
-		bank.AppModuleBasic{},
-		consensus.AppModuleBasic{},
-		gov.NewAppModuleBasic(
-			[]govclient.ProposalHandler{
-				paramsclient.ProposalHandler,
-			},
-		),
-		mint.AppModuleBasic{},
-		slashing.AppModuleBasic{},
-		distr.AppModuleBasic{},
-		no_valupdates_staking.AppModuleBasic{},
-		upgrade.AppModuleBasic{},
-
-		params.AppModuleBasic{},
-	)
+	// ModuleBasics is the basic manager New builds from the module manager:
+	// codec registration, CLI commands and default genesis for the modules the
+	// app actually runs. The root command builds an app before using it.
+	ModuleBasics module.BasicManager
 
 	// module account permissions
 	maccPerms = map[string][]string{
@@ -154,8 +136,9 @@ var (
 		stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
 		stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
 		govtypes.ModuleName:            {authtypes.Burner},
-		providertypes.ModuleName:       nil,
-		ibctransfertypes.ModuleName:    {authtypes.Minter, authtypes.Burner},
+		// The provider burns the consumer registration fee it collects.
+		providertypes.ModuleName:    {authtypes.Burner},
+		ibctransfertypes.ModuleName: {authtypes.Minter, authtypes.Burner},
 	}
 )
 
@@ -188,9 +171,6 @@ type App struct { //nolint:golint
 	EvidenceKeeper evidencekeeper.Keeper
 	MintKeeper     mintkeeper.Keeper
 
-	// NOTE the distribution keeper should either be removed
-	// from consumer chain or set to use an independent
-	// different fee-pool from the consumer chain ConsumerKeeper
 	DistrKeeper           distrkeeper.Keeper
 	GovKeeper             *govkeeper.Keeper // Gov Keeper must be a pointer in the app, so we can SetRouter on it correctly
 	UpgradeKeeper         upgradekeeper.Keeper
@@ -460,7 +440,10 @@ func New(
 		app.IBCKeeper.ChannelKeeper,
 		app.MsgServiceRouter(),
 		app.AccountKeeper,
-		app.BankKeeper,
+		// ibcshim, not the bank keeper directly: ibc-go writes voucher
+		// metadata the bank module's validation refuses, which makes an
+		// export fail `genesis validate`. See app/ibcshim.
+		ibcshim.NewTransferBankKeeper(app.BankKeeper),
 		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
 	)
 
@@ -489,6 +472,11 @@ func New(
 	tmLightClientModule := ibctm.NewLightClientModule(appCodec, app.IBCKeeper.ClientKeeper.GetStoreProvider())
 	app.IBCKeeper.ClientKeeper.AddRoute(ibctm.ModuleName, tmLightClientModule)
 
+	// The staking module is built once: the module manager runs it and
+	// ModuleBasics carries its basic, wrapped to price the key rotation fee in
+	// the bond denom (see stakingModuleBasic).
+	stakingModule := no_valupdates_staking.NewAppModule(appCodec, app.StakingKeeper, app.AccountKeeper, app.BankKeeper, app.GetSubspace(stakingtypes.ModuleName))
+
 	// NOTE: Any module instantiated in the module manager that is later modified
 	// must be passed by reference here.
 	app.MM = module.NewManager(
@@ -502,7 +490,7 @@ func New(
 		slashing.NewAppModule(appCodec, app.SlashingKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper, app.GetSubspace(slashingtypes.ModuleName), app.interfaceRegistry),
 		evidence.NewAppModule(app.EvidenceKeeper),
 		distr.NewAppModule(appCodec, app.DistrKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper, app.GetSubspace(distrtypes.ModuleName)),
-		no_valupdates_staking.NewAppModule(appCodec, app.StakingKeeper, app.AccountKeeper, app.BankKeeper, app.GetSubspace(stakingtypes.ModuleName)),
+		stakingModule,
 		params.NewAppModule(app.ParamsKeeper),
 		upgrade.NewAppModule(&app.UpgradeKeeper, app.AccountKeeper.AddressCodec()),
 		// ibcshim, not ibc directly: works around ibc-go's clientv2 genesis
@@ -514,7 +502,8 @@ func New(
 		providerModule,
 	)
 
-	// NOTE: @Msalopek -> ModuleBasic override is happening because Tx commands don't work without it
+	// The basic manager the CLI and the default genesis use, from the modules
+	// the app runs; genutil and gov carry their CLI-side handlers.
 	ModuleBasics = module.NewBasicManagerFromManager(
 		app.MM,
 		map[string]module.AppModuleBasic{
@@ -524,6 +513,7 @@ func New(
 					paramsclient.ProposalHandler,
 				},
 			),
+			stakingtypes.ModuleName: stakingModuleBasic{stakingModule.AppModuleBasic},
 		})
 	ModuleBasics.RegisterLegacyAminoCodec(app.legacyAmino)
 	ModuleBasics.RegisterInterfaces(app.interfaceRegistry)
