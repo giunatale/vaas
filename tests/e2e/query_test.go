@@ -18,10 +18,11 @@ import (
 // from the provider chain (e.g. phaseLaunched).
 // Consumer phases as the provider's consumer-chain query prints them.
 const (
-	phaseLaunched = "CONSUMER_PHASE_LAUNCHED"
-	phasePaused   = "CONSUMER_PHASE_PAUSED"
-	phaseStopped  = "CONSUMER_PHASE_STOPPED"
-	phaseDeleted  = "CONSUMER_PHASE_DELETED"
+	phaseRegistered = "CONSUMER_PHASE_REGISTERED"
+	phaseLaunched   = "CONSUMER_PHASE_LAUNCHED"
+	phasePaused     = "CONSUMER_PHASE_PAUSED"
+	phaseStopped    = "CONSUMER_PHASE_STOPPED"
+	phaseDeleted    = "CONSUMER_PHASE_DELETED"
 )
 
 func (s *baseTestSuite) queryProviderConsumerPhase(consumerID string) string {

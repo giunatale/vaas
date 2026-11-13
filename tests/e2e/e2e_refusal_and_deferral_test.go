@@ -244,11 +244,18 @@ type pendingEquivocationJSON struct {
 // punishments; the error lets polling callers retry and asserting callers
 // fail rather than read a broken query as an empty queue.
 func (s *baseTestSuite) queryPendingEquivocations(consumerID string) ([]pendingEquivocationJSON, error) {
-	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
+	return s.queryPendingEquivocationsWith(consumerID)
+}
+
+// queryPendingEquivocationsWith is queryPendingEquivocations with extra query
+// flags, such as a past height.
+func (s *baseTestSuite) queryPendingEquivocationsWith(consumerID string, flags ...string) ([]pendingEquivocationJSON, error) {
+	args := append([]string{
 		providerBinary, "query", "vaasprovider", "pending-equivocation-punishments", consumerID,
 		"--home", providerHomePath,
 		"--output", "json",
-	})
+	}, flags...)
+	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, args)
 	if err != nil {
 		return nil, fmt.Errorf("query pending-equivocation-punishments: %w (stderr=%s)", err, stderr.String())
 	}
@@ -328,11 +335,22 @@ type unbondingEntryJSON struct {
 // unbondingEntries lists the delegator's unbonding entries toward the
 // validator (balance and on-hold refcount), or nothing while the query fails.
 func (s *baseTestSuite) unbondingEntries(delegator, valoper string) []unbondingEntryJSON {
-	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
+	return s.unbondingEntriesWith(delegator, valoper)
+}
+
+// unbondingEntriesAt is unbondingEntries as of a past provider height.
+func (s *baseTestSuite) unbondingEntriesAt(delegator, valoper string, height int64) []unbondingEntryJSON {
+	return s.unbondingEntriesWith(delegator, valoper, "--height", strconv.FormatInt(height, 10))
+}
+
+// unbondingEntriesWith is unbondingEntries with extra query flags.
+func (s *baseTestSuite) unbondingEntriesWith(delegator, valoper string, flags ...string) []unbondingEntryJSON {
+	args := append([]string{
 		providerBinary, "query", "staking", "unbonding-delegation", delegator, valoper,
 		"--home", providerHomePath,
 		"--output", "json",
-	})
+	}, flags...)
+	stdout, _, err := s.dockerExec(s.providerValRes[0].Container.ID, args)
 	if err != nil || stdout.Len() == 0 {
 		return nil
 	}
@@ -362,7 +380,16 @@ func (s *baseTestSuite) singleUnbondingEntryHas(delegator, valoper, refCount str
 // mustUnbondingBalance returns the balance of the delegator's single unbonding
 // entry toward the validator.
 func (s *baseTestSuite) mustUnbondingBalance(delegator, valoper string) int64 {
-	entries := s.unbondingEntries(delegator, valoper)
+	return s.mustSingleUnbondingBalance(s.unbondingEntries(delegator, valoper))
+}
+
+// mustUnbondingBalanceAt is mustUnbondingBalance as of a past provider height.
+func (s *baseTestSuite) mustUnbondingBalanceAt(delegator, valoper string, height int64) int64 {
+	return s.mustSingleUnbondingBalance(s.unbondingEntriesAt(delegator, valoper, height))
+}
+
+// mustSingleUnbondingBalance returns the balance of the one entry listed.
+func (s *baseTestSuite) mustSingleUnbondingBalance(entries []unbondingEntryJSON) int64 {
 	s.Require().Len(entries, 1, "expected exactly one unbonding entry")
 	v, err := strconv.ParseInt(entries[0].Balance, 10, 64)
 	s.Require().NoErrorf(err, "unparsable unbonding balance %q", entries[0].Balance)
@@ -370,8 +397,9 @@ func (s *baseTestSuite) mustUnbondingBalance(delegator, valoper string) int64 {
 }
 
 // unbondFrom starts an undelegation of amount from the validator, signed by
-// the keyring key, and waits for the tx to commit.
-func (s *baseTestSuite) unbondFrom(key, valoper, amount string) {
+// the keyring key, waits for the tx to commit and returns the height it
+// landed at.
+func (s *baseTestSuite) unbondFrom(key, valoper, amount string) int64 {
 	stdout, stderr, err := s.dockerExec(s.providerValRes[0].Container.ID, []string{
 		providerBinary, "tx", "staking", "unbond", valoper, amount,
 		"--from", key,
@@ -383,7 +411,7 @@ func (s *baseTestSuite) unbondFrom(key, valoper, amount string) {
 		"-y", "-o", "json",
 	})
 	s.Require().NoErrorf(err, "failed to unbond from %s: stderr=%s", key, stderr.String())
-	s.requireTxCommitted(stdout.Bytes())
+	return s.requireTxCommitted(stdout.Bytes())
 }
 
 // mustUnjail broadcasts MsgUnjail from the keyring key until it is accepted,
