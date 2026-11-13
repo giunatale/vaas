@@ -55,13 +55,14 @@ freezing, or counterparty loss halt traffic rather than reopening the binding.
 
 **Consumer side.** The mirror declaration. The consumer genesis creates no
 client and seeds two facts from the provider: the provider's chain id and the
-owner's address. `MsgSetProviderClient`, signed by that owner (or governance,
-where the embedding app wires it), pins the provider client once, under the
-symmetric validations (existing, tendermint, chain-id match against the seeded
-value, active, counterparty-linked). Every later packet must arrive over the
-pinned client or it is rejected before any state changes. Until the pin lands,
-a message filter keeps the chain in bootstrap: only IBC messages, governance,
-and the pin message itself are accepted.
+owner's address. `MsgSetProviderClient`, signed by that owner (or the chain's
+authority: governance where the embedding app wires it, the consumer module
+account acting for the owner on the reference consumer), pins the provider
+client once, under the symmetric validations (existing, tendermint, chain-id
+match against the seeded value, active, counterparty-linked). Every later
+packet must arrive over the pinned client or it is rejected before any state
+changes. Until the pin lands, a message filter keeps the chain in bootstrap:
+only IBC messages, governance, and the pin message itself are accepted.
 
 Both bindings rest on the owner's signature rather than on anything inferred
 from delivered content, so no relayer, and no chain that merely copies the
@@ -69,9 +70,12 @@ chain-id string, can steer either side onto a client of its choosing. A
 dishonest owner can only mis-declare the consumer that owner registered.
 
 **Re-keying.** The only path to replace a dead client, on either side, is
-IBC's governance client recovery (`MsgRecoverClient`), which substitutes the
-client state under the same client id -- so the pin and the latch survive it.
-No automatic re-binding exists. A recovery, and ibc-go's permissionless client
+IBC's client recovery by the chain's authority (`MsgRecoverClient`), which
+substitutes the client state under the same client id -- so the pin and the
+latch survive it. On the provider that authority is governance; on the
+reference consumer it is the consumer module account, which the consumer's
+owner acts as through `MsgOwnerExec` (see [embedding.md](embedding.md)). No
+automatic re-binding exists. A recovery, and ibc-go's permissionless client
 upgrade (`MsgUpgradeClient`, which takes the upgraded client state the
 consumer committed), can change the chain id the provider's client tracks; the
 provider then pauses the consumer until governance renames it to that chain id
