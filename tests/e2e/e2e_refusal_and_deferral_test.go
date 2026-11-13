@@ -272,7 +272,7 @@ func (s *baseTestSuite) queryPendingEquivocationsWith(consumerID string, flags .
 }
 
 // mustPendingEquivocations is queryPendingEquivocations for assertions.
-func (s *baseTestSuite) mustPendingEquivocations(consumerID string) []pendingEquivocationJSON {
+func (s *baseTestSuite) mustPendingEquivocations(consumerID string) []pendingEquivocationJSON { //nolint:unparam // the suites drive one consumer; the helper stays generic
 	pending, err := s.queryPendingEquivocations(consumerID)
 	s.Require().NoError(err)
 	return pending

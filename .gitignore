@@ -4,6 +4,7 @@ Icon?
 *.out
 coverage.out
 build/
+tests/e2e/forge/forge
 
 # IDEs and editors
 .vscode/
