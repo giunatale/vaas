@@ -6,17 +6,14 @@ go 1.26.11
 // module and the same replaced dependencies: `make check-forge-replaces`, run
 // by `make lint`, fails when these replaces differ from app/go.mod's.
 replace (
-	cosmossdk.io/store => github.com/atomone-hub/cosmos-sdk/store v1.1.2-0.20260107105933-680c2b513b67
-	cosmossdk.io/x/evidence => github.com/atomone-hub/cosmos-sdk/x/evidence v0.1.1
+	cosmossdk.io/x/evidence => github.com/atomone-hub/cosmos-sdk/x/evidence v0.1.2-0.20261112114214-e606aa2b81b1
 	cosmossdk.io/x/upgrade => github.com/atomone-hub/cosmos-sdk/x/upgrade v0.1.5-atomone.1.0.20251218143825-cbb67818e94a
 	github.com/allinbits/vaas => ../../..
 	github.com/allinbits/vaas/app => ../../../app
 	github.com/bytedance/sonic => github.com/bytedance/sonic v1.15.0
-	github.com/cometbft/cometbft => github.com/atomone-hub/cometbft v0.0.0-20251216151559-a24cfa28b916
-	// TEMPORARY: pinned to atomone-hub/atomone-sdk main at the squash of
-	// atomone-hub/atomone-sdk#137 (the pre-rotation staking hook), as app/go.mod
-	// is; switch both to a release tag once one carries the hook.
-	github.com/cosmos/cosmos-sdk => github.com/atomone-hub/cosmos-sdk v0.500.3-0.20261029093443-581d8bc35953
+	// Pinned to atomone-hub/atomone-sdk main at e606aa2 (2026-11-12), as
+	// app/go.mod is; the forge builds against the same atomone-sdk as the apps.
+	github.com/cosmos/cosmos-sdk => github.com/atomone-hub/cosmos-sdk v0.500.3-0.20261112114214-e606aa2b81b1
 	github.com/syndtr/goleveldb => github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 )
 
@@ -39,14 +36,14 @@ require (
 	cloud.google.com/go/monitoring v1.24.3 // indirect
 	cloud.google.com/go/storage v1.56.0 // indirect
 	cosmossdk.io/api v1.0.0-alpha.1 // indirect
-	cosmossdk.io/client/v2 v2.10.0-beta.4 // indirect
+	cosmossdk.io/client/v2 v2.0.0-beta.11 // indirect
 	cosmossdk.io/collections v1.2.1 // indirect
 	cosmossdk.io/core v1.1.0-alpha.2 // indirect
 	cosmossdk.io/depinject v1.2.1 // indirect
 	cosmossdk.io/errors v1.0.2 // indirect
 	cosmossdk.io/math v1.5.3 // indirect
 	cosmossdk.io/schema v1.1.0 // indirect
-	cosmossdk.io/store v1.3.0-alpha.1 // indirect
+	cosmossdk.io/store v1.1.2 // indirect
 	cosmossdk.io/tools/confix v0.1.2 // indirect
 	cosmossdk.io/x/tx v1.2.0-alpha.1 // indirect
 	cosmossdk.io/x/upgrade v0.2.0 // indirect
