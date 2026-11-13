@@ -156,7 +156,7 @@ func (s *IntegrationTestSuite) consumerPinnedProviderClientID() string {
 	s.Require().NoError(err, "failed to query provider info from the consumer")
 	var res struct {
 		Consumer struct {
-			ClientID string `json:"clientID"`
+			ClientID string `json:"client_id"`
 		} `json:"consumer"`
 	}
 	s.Require().NoErrorf(json.Unmarshal([]byte(out), &res), "failed to decode provider info: %s", out)

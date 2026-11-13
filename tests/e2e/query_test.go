@@ -167,7 +167,7 @@ func (s *baseTestSuite) consumerProviderClientID() string {
 	s.Require().NoError(err, "failed to query the consumer's provider info")
 	var res struct {
 		Consumer struct {
-			ClientID string `json:"clientID"`
+			ClientID string `json:"client_id"`
 		} `json:"consumer"`
 	}
 	s.Require().NoErrorf(json.Unmarshal([]byte(info), &res), "failed to decode the consumer's provider info: %s", info)
