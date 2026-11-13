@@ -64,6 +64,10 @@ Both files are decoded with the proto-JSON codec. CLI source:
    removal vote: its `MsgRemoveConsumer` records the verdict and cancels the
    pending punishments, while the consumer stays `STOPPED` and its deletion
    keeps the time the stop scheduled.
+   The votes are verified over the consumer's chain id, or over a chain id the
+   consumer carried before a governance rename when the infraction block is at
+   or below the declared client's height at that rename (`EvidenceChainIdFor`;
+   see [consumer-lifecycle.md](consumer-lifecycle.md) on renames).
 2. Rejects evidence older than the consumer's equivocation-evidence minimum
    height. Note the *age* of the vote is not otherwise bounded -- there is no
    max-age on double-vote evidence.

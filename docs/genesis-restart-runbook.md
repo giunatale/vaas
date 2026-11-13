@@ -63,7 +63,8 @@ pairing (ibc-go#9063).
   time, the liveness clock (`LastAckTime`, `HighestSentVscId`,
   `HighestAckedVscId`), the in-debt flag, and the governance-removal record
   (`removed_by_governance`, set only on a `STOPPED` consumer) that refuses
-  later double-voting evidence;
+  later double-voting evidence, and the previous chain ids a governance rename
+  retired, each with its boundary height;
 - the refusal signals, the pending equivocation punishments with the
   unbonding operations held and the jails closed behind them, and the record
   of punished equivocations;

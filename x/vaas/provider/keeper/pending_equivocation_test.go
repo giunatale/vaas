@@ -10,6 +10,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	ibcexported "github.com/cosmos/ibc-go/v10/modules/core/exported"
+	ibctmtypes "github.com/cosmos/ibc-go/v10/modules/light-clients/07-tendermint"
 
 	"cosmossdk.io/collections"
 	"cosmossdk.io/math"
@@ -1539,6 +1540,7 @@ func TestResumeThawsPendingEquivocationPunishments(t *testing.T) {
 	pausedFor := 3 * time.Hour
 	resumed := ctx.WithBlockTime(ctx.BlockTime().Add(pausedFor))
 	mocks.MockClientKeeper.EXPECT().GetClientStatus(gomock.Any(), "07-tendermint-0").Return(ibcexported.Active)
+	expectDeclaredClientState(mocks)
 	resumeMocks(mocks)
 	mocks.MockSlashingKeeper.EXPECT().IsTombstoned(resumed, consAddr).Return(false)
 	mocks.MockStakingKeeper.EXPECT().GetValidatorByConsAddr(resumed, consAddr).Return(validator, nil)
@@ -1588,6 +1590,7 @@ func TestResumeDropsTheEntriesOfAValidatorTombstonedDuringThePause(t *testing.T)
 
 	resumed := ctx.WithBlockTime(ctx.BlockTime().Add(3 * time.Hour))
 	mocks.MockClientKeeper.EXPECT().GetClientStatus(gomock.Any(), "07-tendermint-0").Return(ibcexported.Active)
+	expectDeclaredClientState(mocks)
 	resumeMocks(mocks)
 	mocks.MockSlashingKeeper.EXPECT().IsTombstoned(resumed, consAddr).Return(true)
 	mocks.MockStakingKeeper.EXPECT().UnbondingCanComplete(resumed, uint64(13)).Return(nil)
@@ -1626,6 +1629,7 @@ func TestResumeLeavesAnEntryMaturedBeforeThePauseInPlace(t *testing.T) {
 
 	resumed := paused.WithBlockTime(paused.BlockTime().Add(3 * time.Hour))
 	mocks.MockClientKeeper.EXPECT().GetClientStatus(gomock.Any(), "07-tendermint-0").Return(ibcexported.Active)
+	expectDeclaredClientState(mocks)
 	resumeMocks(mocks)
 	mocks.MockSlashingKeeper.EXPECT().IsTombstoned(resumed, consAddr).Return(false)
 	mocks.MockStakingKeeper.EXPECT().GetValidatorByConsAddr(resumed, consAddr).Return(validator, nil)
@@ -1690,6 +1694,7 @@ func TestAnEntryQueuedDuringAPauseThawsToOneDelayAfterTheResume(t *testing.T) {
 	resumed := ctx.WithBlockTime(pausedAt.Add(3 * time.Hour))
 	mocks.MockClientKeeper.EXPECT().GetClientStatus(gomock.Any(), "07-tendermint-0").Return(ibcexported.Active)
 	resumeMocks(mocks)
+	expectDeclaredClientState(mocks)
 	mocks.MockSlashingKeeper.EXPECT().IsTombstoned(resumed, consAddr).Return(false)
 	mocks.MockStakingKeeper.EXPECT().GetValidatorByConsAddr(resumed, consAddr).Return(validator, nil)
 	expectSigningInfo(mocks, resumed, consAddr, pauseExpiration.Add(24*time.Hour))
@@ -1744,6 +1749,7 @@ func TestTheThawAtThePauseInstant(t *testing.T) {
 	resumed := paused.WithBlockTime(pausedAt.Add(3 * time.Hour))
 	mocks.MockClientKeeper.EXPECT().GetClientStatus(gomock.Any(), "07-tendermint-0").Return(ibcexported.Active)
 	resumeMocks(mocks)
+	expectDeclaredClientState(mocks)
 	require.NoError(t, k.ResumeConsumerChain(resumed, consumerID))
 
 	kept, err := k.PendingEquivocationPunishments.Get(resumed, dueAtPause)
@@ -1815,4 +1821,12 @@ func TestALapsedPauseThawsTheFrozenPunishmentsIntoTheStop(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, pauseExpiration.Add(delay), thawedAfter.ExecutesAt,
 		"an entry queued during the pause gets one full delay from the stop")
+}
+
+// expectDeclaredClientState gives the resume the declared client it checks:
+// one tracking the consumer's chain id (unset in these tests) with a trusting
+// period above the downtime challenge horizon.
+func expectDeclaredClientState(mocks testkeeper.MockedKeepers) {
+	mocks.MockClientKeeper.EXPECT().GetClientState(gomock.Any(), "07-tendermint-0").
+		Return(&ibctmtypes.ClientState{TrustingPeriod: 14 * 24 * time.Hour}, true).AnyTimes()
 }
