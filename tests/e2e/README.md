@@ -5,7 +5,7 @@ consumer chain, and the `ibc-v2-ts-relayer`, then exercise the full VAAS
 lifecycle: consumer registration, genesis bootstrapping, IBC v2 client
 declaration, VSC synchronization, downtime slashing and challenges, fee pooling
 and distribution, the photon fee policy and the node fee floor, key assignment,
-refusal and punishment deferral, liveness,
+the owner's authority on the consumer, refusal and punishment deferral, liveness,
 genesis round-trip, and, on four validator nodes per chain, the validator set
 mirror, a delegation change, an offline validator's slash and recovery, a
 key assignment under a node restart, the refusal threshold, a provider
@@ -78,7 +78,10 @@ challenge-gated flow completes inside a test run.
 
 The scenarios run as an **ordered** sequence in `TestVAAS`
 ([e2e_test.go](e2e_test.go)); each scenario's doc comment says what it proves,
-and the call-site comments in that list state the ordering constraints. The
+and the call-site comments in that list state the ordering constraints;
+`testOwnerExec` ([e2e_owner_exec_test.go](e2e_owner_exec_test.go)) is the
+owner-authority scenario, a consumer params update through `MsgOwnerExec`
+paid in vouchers, with a user's attempt at the same refused. The
 order matters: later tests depend on consumer `"0"` staying `LAUNCHED` until
 liveness removal, and the two genesis round-trips run late: the consumer one
 after every scenario that needs consumer-to-provider traffic, the provider one
@@ -225,6 +228,7 @@ threshold). It takes about 30 minutes.
 | `e2e_fee_pool_test.go` | fee-pool send restriction, locks, gov clawback |
 | `e2e_fee_distribution_test.go` | per-epoch validator payout out of a consumer's fee pool |
 | `e2e_photon_fee_test.go` | photon-only fee policy: native fees rejected, vouchers bridged in while enforcing, voucher fees commit |
+| `e2e_owner_exec_test.go` | the owner's authority on the consumer: a consumer params update through `MsgOwnerExec`, paid in vouchers; a user's attempt refused |
 | `e2e_fee_floor_test.go` | node fee floor in the voucher denom, set by restarting the consumer validator: below-floor rejection at CheckTx, IBC core traffic floored once pinned, relayer paying the floor in vouchers |
 | `e2e_key_assignment_test.go` | consumer key assignment and the consumer switching onto it |
 | `e2e_consumer_liveness_test.go` | liveness / safe-mode scenarios |
