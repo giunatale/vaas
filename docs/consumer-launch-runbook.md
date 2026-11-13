@@ -204,7 +204,8 @@ consumer's fee payers in between when the consumer enforces photon-only fees
 
 Each declaration is validated before it binds (an active tendermint client of
 the right chain id with a registered counterparty; on the provider side also a
-trusting period above the downtime challenge horizon) and is permanent once
+trusting period above the downtime challenge horizon and, with the client's clock-drift
+allowance, within the provider's unbonding period) and is permanent once
 accepted ([security-model.md](security-model.md)). A pinned client that later
 expires is recovered in place, under the same id, by the chain's authority:
 on the reference consumer the owner wraps ibc-go's `MsgRecoverClient`, signed

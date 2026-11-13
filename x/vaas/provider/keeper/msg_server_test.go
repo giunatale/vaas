@@ -1068,7 +1068,7 @@ func TestResumeConsumerGovAuth(t *testing.T) {
 
 	providerKeeper.SetInfractionParams(ctx, providertypes.DefaultInfractionParameters())
 
-	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).Times(1)
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).AnyTimes()
 
 	msgServer := providerkeeper.NewMsgServerImpl(&providerKeeper)
 

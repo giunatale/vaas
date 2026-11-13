@@ -45,6 +45,9 @@ const reaccuseTestChainID = "consumer-chain-reaccuse"
 func TestResumeThenReaccuse_SameWindowRejectedLaterWindowChallengeable(t *testing.T) {
 	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
+	// The client below keeps a year-long trusting period; the provider unbonding
+	// period must outlast it for the resume's client check.
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(2*365*24*time.Hour, nil).AnyTimes()
 
 	const cid = uint64(0)
 	const clientId = "07-tendermint-0"

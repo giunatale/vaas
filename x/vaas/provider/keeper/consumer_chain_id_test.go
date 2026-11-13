@@ -229,6 +229,7 @@ func pausedForMismatch(t *testing.T, k providerkeeper.Keeper, ctx sdk.Context, m
 func TestAMismatchPauseEndsWithARenameAndAResume(t *testing.T) {
 	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).AnyTimes()
 	msgServer := providerkeeper.NewMsgServerImpl(&k)
 	cid, _ := pausedForMismatch(t, k, ctx, mocks)
 
@@ -251,6 +252,7 @@ func TestAMismatchPauseEndsWithARenameAndAResume(t *testing.T) {
 func TestAMismatchPauseEndsWithARecoveryAndAResume(t *testing.T) {
 	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).AnyTimes()
 	cid, clientState := pausedForMismatch(t, k, ctx, mocks)
 
 	clientState.ChainId = chainIDTestOld
@@ -310,6 +312,7 @@ func TestResumeRefusesAClientWhoseTrustingPeriodIsUnderTheHorizon(t *testing.T) 
 func TestGovernanceRenamesALaunchedConsumerToItsClientsChainId(t *testing.T) {
 	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).AnyTimes()
 	msgServer := providerkeeper.NewMsgServerImpl(&k)
 	cid := launchedWithRecoveredClient(t, k, ctx, mocks)
 	_, accused := newSweepValidator(t)
@@ -463,6 +466,7 @@ func TestGovernanceRenameRefusesAClientUnderTheTrustingPeriodFloor(t *testing.T)
 func TestGovernanceRenameBackToAPreviousChainIdIsRefused(t *testing.T) {
 	k, ctx, ctrl, mocks := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
 	defer ctrl.Finish()
+	mocks.MockStakingKeeper.EXPECT().UnbondingTime(gomock.Any()).Return(21*24*time.Hour, nil).AnyTimes()
 	msgServer := providerkeeper.NewMsgServerImpl(&k)
 	cid, clientState := pausedForMismatch(t, k, ctx, mocks)
 	_, err := msgServer.UpdateConsumer(ctx, &types.MsgUpdateConsumer{Owner: k.GetAuthority(), ConsumerId: cid, NewChainId: chainIDTestNew})

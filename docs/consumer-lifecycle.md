@@ -172,7 +172,9 @@ BeginBlock (see [Renaming a launched consumer](#renaming-a-launched-consumer)).
    fee records keep their state with their clocks stopped, and a resume restarts the clocks
    where the pause stopped them (see [consumer-refusal.md](consumer-refusal.md) section 1).
 2. Phase is set to `PAUSED` and the pause reason recorded; `vaas_consumer_paused` names it.
-3. An automatic stop is scheduled at `block_time + MaxPauseDuration` (default 45 days).
+3. An automatic stop is scheduled at `block_time + MaxPauseDuration` (default 45 days); a
+   light-client pause is not stopped before its fork wait has run, so a resume is always
+   possible at some point (see [consumer-downtime.md](consumer-downtime.md)).
 4. No further VSC packets are queued or sent; fee distribution and downtime evidence from
    this consumer stop (double-voting evidence is still accepted); the liveness sweep skips it; the consumer's pending equivocation
    punishments are frozen for the length of the pause.
@@ -233,7 +235,8 @@ already carries the verdict cannot be removed again.
    - Deletes: IBC client ID mapping, consumer genesis, key assignments, equivocation
      evidence minimum height, pending VSC packets, validator set, removal time, the
      liveness state (last-ack time and the sent/acked VSC-id counters), the refusals,
-     the pause reason, paused-at and fork-known-at times, the governance-removal
+     the pause reason, paused-at and fork-known-at times, the
+     client-recovered-since-fork mark, the governance-removal
      record, the previous chain ids a rename retired, the in-debt flag, the
      per-consumer fees-per-block override, and the
      downtime state (pending downtime slashes, epoch downtime marks, withheld fee

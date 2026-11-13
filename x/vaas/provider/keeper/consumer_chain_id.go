@@ -107,15 +107,29 @@ func (k Keeper) PauseConsumersWithMismatchedClients(ctx sdk.Context) {
 }
 
 // validateConsumerClientTrustingPeriod refuses a client whose trusting period
-// cannot cover the downtime challenge horizon: every accepted downtime
-// accusation must stay disprovable by a header the client can still verify.
+// cannot cover the downtime challenge horizon (every accepted downtime
+// accusation must stay disprovable by a header the client can still verify)
+// or whose fork wait, the trusting period plus the clock-drift allowance (see
+// forkWait), exceeds the provider's unbonding period: that wait is how long a
+// light-client pause can outlive MaxPauseDuration, the provider bounds every
+// pause by its own unbonding period (see BeginBlockAutoStopPausedConsumers),
+// and a client whose wait is longer could never be resumed after a fork.
 // Checked at declaration, at a governance rename and at resume, since a
-// client upgrade or recovery can change the trusting period.
+// client upgrade or recovery can change both values.
 func (k Keeper) validateConsumerClientTrustingPeriod(ctx sdk.Context, clientId string, tmClientState *ibctmtypes.ClientState) error {
 	if horizon := k.GetInfractionParams(ctx).ChallengeableInterval(); tmClientState.TrustingPeriod <= horizon {
 		return errorsmod.Wrapf(types.ErrInvalidMsgUpdateConsumer,
 			"client %s trusting period (%s) must exceed the downtime challenge horizon (%s): every accepted downtime accusation must stay disprovable by a header this client can still verify",
 			clientId, tmClientState.TrustingPeriod, horizon)
+	}
+	providerUnbonding, err := k.stakingKeeper.UnbondingTime(ctx)
+	if err != nil {
+		return errorsmod.Wrapf(types.ErrNoUnbondingTime, "unbonding time not found: %s", err)
+	}
+	if clientForkWaitExceeds(tmClientState, providerUnbonding) {
+		return errorsmod.Wrapf(types.ErrInvalidMsgUpdateConsumer,
+			"client %s trusting period (%s) plus clock-drift allowance (%s) must not exceed the provider unbonding period (%s): a resume after a light-client pause waits that long from the fork, and no pause waits longer than the provider's unbonding period",
+			clientId, tmClientState.TrustingPeriod, tmClientState.MaxClockDrift, providerUnbonding)
 	}
 	return nil
 }
