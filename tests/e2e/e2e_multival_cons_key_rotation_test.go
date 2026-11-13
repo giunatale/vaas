@@ -199,7 +199,7 @@ func (s *MultiValidatorIntegrationTestSuite) testConsensusKeyRotation() {
 			val0.consAddr, consAddrFromEd25519PubKey(assignedPub))
 		code, rawLog := s.rotateConsensusKey(0, val0.valoper, ed25519PubKeyJSON(assignedPub))
 		s.Require().NotZerof(code, "val0's rotation onto val3's assigned consumer key was admitted")
-		s.Require().Containsf(rawLog, "already assigned as another validator's consumer key",
+		s.Require().Containsf(rawLog, "already assigned as a consumer key",
 			"val0's rotation was refused for another reason: %s", rawLog)
 		s.Require().Equalf(val0.consAddr, s.providerValidatorConsAddr(val0.valoper),
 			"the refused rotation changed val0's consensus key")

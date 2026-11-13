@@ -1,8 +1,8 @@
 package e2e
 
 const (
-	providerBinary   = "provider"
-	consumerBinary   = "consumer"
+	providerBinary = "provider"
+	consumerBinary = "consumer"
 	// consumerBech32Prefix is the address prefix the consumer chain runs
 	// under. It differs from the provider's ("cosmos", this test binary's own
 	// configuration) on purpose: every scenario then crosses the two prefixes,
@@ -10,12 +10,12 @@ const (
 	// Consumer-side addresses are re-encoded under this binary's prefix when
 	// they are read (see queryConsumerNetValidators and consAddrToCometHex).
 	consumerBech32Prefix = "shard"
-	providerHomePath = "/home/nonroot/.provider"
-	consumerHomePath = "/home/nonroot/.consumer"
-	bondDenom        = "uatone"
-	feeDenom         = "uphoton"
-	providerChainID  = "provider-e2e"
-	consumerChainID  = "consumer-e2e"
+	providerHomePath     = "/home/nonroot/.provider"
+	consumerHomePath     = "/home/nonroot/.consumer"
+	bondDenom            = "uatone"
+	feeDenom             = "uphoton"
+	providerChainID      = "provider-e2e"
+	consumerChainID      = "consumer-e2e"
 	// initHomesPath is where an init container sees the host directory that
 	// holds a chain's node homes (val0, val1, ...).
 	initHomesPath = "/home/nonroot/homes"
