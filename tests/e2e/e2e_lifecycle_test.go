@@ -1096,26 +1096,6 @@ func (s *baseTestSuite) providerLatestBlock() (int64, time.Time) {
 	return height, status.Result.SyncInfo.LatestBlockTime
 }
 
-// providerBlockTime returns the header time of the provider block at height,
-// which is the block time every keeper deadline in that block was judged
-// against.
-func (s *baseTestSuite) providerBlockTime(height int64) time.Time {
-	body, err := httpGet(fmt.Sprintf("%s/block?height=%d", s.providerRPCEndpoint(), height))
-	s.Require().NoErrorf(err, "failed to query provider block %d", height)
-	var res struct {
-		Result struct {
-			Block struct {
-				Header struct {
-					Time time.Time `json:"time"`
-				} `json:"header"`
-			} `json:"block"`
-		} `json:"result"`
-	}
-	s.Require().NoErrorf(json.Unmarshal(body, &res), "failed to decode provider block %d: %s", height, string(body))
-	s.Require().Falsef(res.Result.Block.Header.Time.IsZero(), "provider block %d carries no time: %s", height, string(body))
-	return res.Result.Block.Header.Time
-}
-
 // waitForProviderBlockTime blocks until the provider's latest block time is
 // at or past t.
 func (s *baseTestSuite) waitForProviderBlockTime(t time.Time) {
