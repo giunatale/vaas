@@ -172,6 +172,7 @@ The per-consumer-chain settings, held on the consumer. Source:
 | `owner_address` | string | empty, or a bech32 address under any prefix | empty; the provider seeds the consumer's registered owner, rendered under the provider's prefix. It is the account that may pin the provider client with `MsgSetProviderClient` (the governance authority always may; see [security-model.md](security-model.md)) |
 | `signed_blocks_window` | int64 | `> 0` | `600` (provider-owned) |
 | `min_signed_per_window` | LegacyDec | `(0, 1)` | `0.5` (provider-owned) |
+| `photon_fees_enabled` | bool | none | `false` |
 
 **Where set:** these values arrive in the consumer genesis that the provider
 builds at launch (`MakeConsumerGenesis`), seeded from the per-consumer
@@ -184,6 +185,15 @@ change them locally (`UpdateParams` in
 liveness-facing subset (`vaas_timeout_period`, `unbonding_period`,
 `safe_mode_threshold`) is documented with its cross-chain bounds in
 [consumer-liveness.md](consumer-liveness.md) section 5.
+
+`photon_fees_enabled` is consumer-local: the provider-authored genesis always
+writes it off, and a chain opts in through a hand-authored genesis or, where
+the embedding app wires a params authority, a later `MsgUpdateParams`. On, the
+consumer's ante chain accepts user fees only in the one-hop `uphoton` voucher
+received over the pinned provider client
+([photon_fee_ante.go](../x/vaas/consumer/ante/photon_fee_ante.go)); the node
+fee floor that goes with it is covered in
+[consumer-launch-runbook.md](consumer-launch-runbook.md) section 6.
 
 ---
 
