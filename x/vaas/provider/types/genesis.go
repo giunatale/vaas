@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/cometbft/cometbft/crypto/encoding"
+
 	host "github.com/cosmos/ibc-go/v10/modules/core/24-host"
 
 	errorsmod "cosmossdk.io/errors"
