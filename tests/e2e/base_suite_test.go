@@ -323,6 +323,11 @@ func (s *baseTestSuite) startChainNodeWith(chainID, homePath, hostHome string, i
 		Cmd:        run.cmd,
 		Env:        run.env,
 	}
+	// Every consumer node, whatever binary or image runs it, encodes its
+	// addresses under the consumer's prefix (see consumerBech32Prefix).
+	if homePath == consumerHomePath {
+		opts.Env = append(append([]string{}, run.env...), "VAAS_BECH32_PREFIX="+consumerBech32Prefix)
+	}
 	if index == 0 {
 		opts.PortBindings = map[docker.Port][]docker.PortBinding{
 			"26657/tcp": {{HostIP: "", HostPort: ports.rpc}},
@@ -680,6 +685,7 @@ func (s *baseTestSuite) initAndStartConsumer(consumerGenesisJSON []byte) {
 		"CHAIN_ID=" + s.cfg.consumerChainID,
 		"DENOM=" + bondDenom,
 		"MNEMONIC=" + relayerMnemonic,
+		"VAAS_BECH32_PREFIX=" + consumerBech32Prefix,
 	}
 	if s.cfg.enableConsumerPhotonFees {
 		initEnv = append(initEnv, "MIN_GAS_PRICE=0"+bondDenom)

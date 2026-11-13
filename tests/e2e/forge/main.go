@@ -21,6 +21,7 @@ import (
 	svrcmd "github.com/cosmos/cosmos-sdk/server/cmd"
 	servertypes "github.com/cosmos/cosmos-sdk/server/types"
 
+	"github.com/allinbits/vaas/app/bech32prefix"
 	"github.com/allinbits/vaas/app/cmd/consumer/cmd"
 	consumerapp "github.com/allinbits/vaas/app/consumer"
 	appparams "github.com/allinbits/vaas/app/consumer/params"
@@ -37,19 +38,14 @@ func (a forgedApp) FinalizeBlock(req *abci.RequestFinalizeBlock) (*abci.Response
 	return a.App.FinalizeBlock(a.lie.apply(req))
 }
 
-// bech32Prefix is the account address prefix the node configures, read as
-// the consumer binary reads it: VAAS_BECH32_PREFIX from the environment, or
-// "cosmos" when it is unset. The validator and consensus prefixes derive
-// from it with the cosmos-sdk suffixes.
-func bech32Prefix() string {
-	if prefix := os.Getenv("VAAS_BECH32_PREFIX"); prefix != "" {
-		return prefix
-	}
-	return "cosmos"
-}
-
 func main() {
-	appparams.SetAddressPrefixes(bech32Prefix())
+	// The prefix is read as the consumer binary reads it.
+	prefix, err := bech32prefix.FromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	appparams.SetAddressPrefixes(prefix)
 
 	l, err := lieFromEnv()
 	if err != nil {
