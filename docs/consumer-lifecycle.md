@@ -182,7 +182,7 @@ snapshot resync (the resume pre-flights the IBC client and fails with `MsgRecove
 guidance if the client expired or was frozen during the pause, and fails while the client
 tracks a chain ID other than the consumer's or its trusting period does not clear the
 downtime challenge horizon; after a light-client pause it is accepted only once one client
-trusting period has passed since the pause, when the fork's evidence can no longer pause the
+trusting period has passed since the fork became known, when the fork's evidence can no longer pause the
 consumer); `MsgRemoveConsumer` (gov) or the scheduled auto-stop moves it to `STOPPED`.
 
 ---
@@ -201,6 +201,9 @@ consumer); `MsgRemoveConsumer` (gov) or the scheduled auto-stop moves it to `STO
 2. The consumer is added to a time-indexed removal queue keyed by
    `block_time + provider_unbonding_period`.
 3. No further VSC packets are queued or sent to this consumer.
+4. Its pending downtime slashes are cancelled, and the fee shares withheld from its accused
+   validators are released to the pool's share-holders: a stopped consumer cannot be
+   challenged, so nothing could claim them any more.
 
 A consumer stopped by the liveness sweep or the pause auto-stop can still be
 removed by governance. `MsgRemoveConsumer` then leaves the phase and the
@@ -228,9 +231,10 @@ already carries the verdict cannot be removed again.
    chance any depositor gets — withdrawals are rejected once the phase is `DELETED`.
    It then:
    - Deletes: IBC client ID mapping, consumer genesis, key assignments, equivocation
-     evidence minimum height, init-chain height, pending VSC packets, validator set,
-     removal time, the liveness state (last-ack time and the sent/acked VSC-id
-     counters), the refusal signals, the pause reason and time, the in-debt flag, the
+     evidence minimum height, pending VSC packets, validator set, removal time, the
+     liveness state (last-ack time and the sent/acked VSC-id counters), the refusals,
+     the pause reason, paused-at and fork-known-at times, the governance-removal
+     record, the previous chain ids a rename retired, the in-debt flag, the
      per-consumer fees-per-block override, the fee-pool-address reverse lookup, and the
      downtime state (pending downtime slashes, epoch downtime marks, withheld fee
      records, accepted windows, and window floors).

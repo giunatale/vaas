@@ -426,7 +426,7 @@ func TestGenesisRoundTripKeepsPreviousChainIds(t *testing.T) {
 
 	// No other consumer may hold a previous chain id.
 	taken := expA.ConsumerStates[0]
-	taken.ConsumerId = 7
+	taken.ConsumerId = 1
 	taken.ChainId = chainIDTestOld
 	taken.PreviousChainIds = nil
 	withTaken := *expA

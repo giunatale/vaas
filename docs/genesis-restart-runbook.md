@@ -32,9 +32,11 @@ consumer export > consumer_exported.json
 ```
 
 `--height <h>` exports at a specific height. `--for-zero-height` additionally
-scrubs height-relative state (it resets signing-info start heights) for a chain
-that will restart at height 0; use it only for a genuine height-zero relaunch,
-not for a normal halt-and-continue.
+scrubs height-relative state for a chain that will restart at height 0: on the
+provider it resets signing-info start heights; on the consumer, which keeps no
+signing infos, it drops the downtime window in progress, whose bitmaps and
+first-tracked heights are keyed on the old chain's heights. Use it only for a
+genuine height-zero relaunch, not for a normal halt-and-continue.
 
 Always validate an exported (or hand-edited) genesis before starting a node
 from it:
@@ -50,7 +52,12 @@ still fail (or panic) at `InitChain`. Both e2e round trips run it on their
 exports, so an export the binaries produce is one they validate; the IBC
 module's step goes through `app/ibcshim` on both reference apps, as `InitChain`
 does, because ibc-go's check rejects the normal `07-tendermint-0` client
-pairing (ibc-go#9063).
+pairing (ibc-go#9063). One rule a hand-edited provider genesis
+can break and a chain-produced export never does: the `consumer_states` ids
+must be exactly `0..n-1` (deleted consumers included, as the export writes
+them). The provider enumerates consumers from its id sequence, so a gap would
+export a phantom consumer and never round-trip; both the CLI and `InitChain`
+reject it.
 
 ## Provider module
 

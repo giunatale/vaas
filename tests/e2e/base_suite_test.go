@@ -747,9 +747,7 @@ func (s *baseTestSuite) initAndStartConsumer(consumerGenesisJSON []byte) {
 		})
 	}
 
-	// Patch consumer slashing params for aggressive downtime detection, then
-	// hand the finished genesis to every node.
-	s.patchConsumerSlashingParams()
+	// Hand the finished genesis to every node.
 	s.copyToAllHomes(homes, filepath.Join("config", "genesis.json"))
 
 	// Apply the suite-specific config.toml mutations (e.g. fast blocks).

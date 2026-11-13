@@ -46,7 +46,10 @@ type AppModule struct {
 	// embed the Cosmos SDK's x/staking AppModule
 	staking.AppModule
 
-	keeper     keeper.Keeper
+	// keeper is the same pointer the embedded module holds, so hooks set on
+	// the keeper after this module is constructed (the app wires SetHooks
+	// separately) reach the InitGenesis and EndBlock below.
+	keeper     *keeper.Keeper
 	accKeeper  types.AccountKeeper
 	bankKeeper types.BankKeeper
 }
@@ -63,7 +66,7 @@ func NewAppModule(
 	stakingAppMod := staking.NewAppModule(cdc, keeper, ak, bk, ls)
 	return AppModule{
 		AppModule:  stakingAppMod,
-		keeper:     *keeper,
+		keeper:     keeper,
 		accKeeper:  ak,
 		bankKeeper: bk,
 	}

@@ -297,8 +297,10 @@ stake, its bond, and its seat. Note the asymmetry -- *forgetting the
 altogether produces no signal at all.
 
 The consumer app wires no `x/evidence`, correctly: a consumer has no stake to
-slash, and its ante chain blocks `/cosmos.evidence` and `/cosmos.slashing`
-messages outright.
+slash. It registers neither the `x/evidence` nor the `x/slashing` message
+types, so a transaction carrying one fails to decode, and its ante chain
+refuses `/cosmos.evidence` and `/cosmos.slashing` messages outright for a host
+that does register them.
 
 ## 6. The consumer's message-filter decorator
 
@@ -500,38 +502,19 @@ pin the rate.
 ## 11. Consumer keeper construction order
 
 The consumer has no staking module: `ConsumerKeeper` stands in as the staking
-keeper for `x/slashing` and `x/genutil`, and it in turn takes the IBC client
-and channel keepers and the slashing keeper. The reference app constructs it in
-three steps:
+keeper for `x/genutil`, the only module of the reference consumer that asks for
+one. The construction order follows from the arguments: `ibckeeper.NewKeeper`
+first, then `ibcconsumerkeeper.NewKeeper`, which takes the IBC client keepers
+and the IBC v2 channel keeper. ibc-go v10.5's `ibckeeper.NewKeeper` takes
+neither the consumer keeper nor any staking keeper, and panics only on a nil or
+zero upgrade keeper or a blank authority, so the consumer keeper needs no
+placeholder before it.
 
-1. `NewNonZeroKeeper` -- a collections-only placeholder assigned to
-   `app.ConsumerKeeper` before the IBC keeper exists;
-2. `ibckeeper.NewKeeper`;
-3. the real `ibcconsumerkeeper.NewKeeper`, taking the IBC client and channel
-   keepers and the slashing keeper, assigned over the placeholder.
-
-Step 1 is not what keeps the app up. ibc-go v10's `ibckeeper.NewKeeper` takes
-the codec, store service, param subspace, upgrade keeper and authority, and
-panics only on an empty upgrade keeper or an empty authority; nothing between
-the placeholder and the real constructor reads the consumer keeper, so an app
-that skips the placeholder starts the same. What the order protects is the
-slashing keeper, constructed before any of this and handed
-`&app.ConsumerKeeper`.
-
-Two order traps:
-
-- the slashing keeper must be given `&app.ConsumerKeeper` (a pointer), so the
-  assignment in step 3 is visible to it. Hand it a copy and `x/slashing` runs
-  against the zero keeper the field held at that line, and panics the first
-  time it reads it;
-- `ibcconsumer.NewAppModule` takes the keeper **by value**, so it must be
-  constructed *after* `SetHooks`. Build it earlier and the module holds a
-  pre-hooks copy, so `ApplyVaasValidatorChanges` creates no signing info when a
-  validator joins; `x/slashing` then fails on that validator's first vote (no
-  signing info), its `BeginBlocker` returns the error out of `FinalizeBlock`,
-  and the node halts at the second block. The provider's `NewAppModule` takes a
-  pointer, so order does not matter there -- the two modules differ, and it is
-  easy to get backwards.
+One order trap, silent: `ibcconsumer.NewAppModule` takes the keeper
+**by value**, so it must be constructed after the keeper is complete; a module
+built from an earlier copy keeps that copy. The provider's `NewAppModule`
+takes a pointer, so order does not matter there -- the two modules differ,
+and it is easy to get backwards.
 
 ## 12. The provider's gov keeper
 
@@ -583,6 +566,5 @@ without.
 | Provider module after staking in `SetOrderEndBlockers` | silent | provider valset and every VSC packet lag one block |
 | Provider module after staking/genutil in `SetOrderInitGenesis` | **fatal at genesis** | "validator set is empty after InitGenesis" |
 | `ibcRouterV2` app-id routes | silent at startup, total at packet time | no VSC or evidence packet routes |
-| `&app.ConsumerKeeper` (a pointer) into the slashing keeper | **panic** at the first read | `x/slashing` holds the zero keeper the field had at construction |
 | Provider fee denom | **fatal at startup** if malformed; silent if valid-but-wrong | `NewKeeper` panics, or pools use a denom nobody holds |
-| Consumer module built before `SetHooks` | **halt at block 2** | no signing info for the validators; `x/slashing` fails the second block's `BeginBlock` on their first vote |
+| Consumer module built from an incomplete keeper | silent | the module keeps the early copy |
