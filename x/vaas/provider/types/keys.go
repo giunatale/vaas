@@ -69,5 +69,8 @@ var (
 	ConsumersRemovedByGovernancePrefix     = collections.NewPrefix(47)
 	ConsumerPreviousChainIdsPrefix         = collections.NewPrefix(48)
 	ConsumerForkKnownAtPrefix              = collections.NewPrefix(49)
-	ParametersPrefix                       = collections.NewPrefix(0xFF)
+	// LiveConsumerIdsPrefix holds the set of consumer ids whose phase is not
+	// DELETED, the ids every per-block and per-epoch walk visits.
+	LiveConsumerIdsPrefix = collections.NewPrefix(51)
+	ParametersPrefix      = collections.NewPrefix(0xFF)
 )

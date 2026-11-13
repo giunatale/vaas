@@ -1246,3 +1246,22 @@ func TestGenesisRoundTripKeepsTheGovernanceRemovalRecord(t *testing.T) {
 	expA.ConsumerStates[1].RemovedByGovernance = true
 	require.ErrorContains(t, expA.Validate(), "only set on a stopped consumer")
 }
+
+// TestInitGenesisPanicsOnRegistrationFeeOutsideTheFeeDenom: the genesis
+// parameters go through the keeper's check, so a positive consumer
+// registration fee in a denom other than the fee denom halts InitChain.
+func TestInitGenesisPanicsOnRegistrationFeeOutsideTheFeeDenom(t *testing.T) {
+	k, ctx, ctrl, _ := testkeeper.GetProviderKeeperAndCtx(t, testkeeper.NewInMemKeeperParams(t))
+	defer ctrl.Finish()
+
+	gs := providertypes.DefaultGenesisState()
+	gs.Params.ConsumerRegistrationFee = sdk.NewInt64Coin("uatone", 1)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		k.InitGenesis(ctx, gs)
+	}()
+	require.NotNil(t, recovered)
+	require.Contains(t, fmt.Sprint(recovered), "is not the fee denom")
+}

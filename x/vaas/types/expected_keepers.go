@@ -96,6 +96,7 @@ type BankKeeper interface {
 	InputOutputCoins(ctx context.Context, input banktypes.Input, outputs []banktypes.Output) error
 	SendCoinsFromAccountToModule(ctx context.Context, senderAddr sdk.AccAddress, recipientModule string, amt sdk.Coins) error
 	SendCoinsFromModuleToAccount(ctx context.Context, senderModule string, recipientAddr sdk.AccAddress, amt sdk.Coins) error
+	BurnCoins(ctx context.Context, moduleName string, amt sdk.Coins) error
 }
 
 // AccountKeeper defines the expected account keeper; VAAS reads only its

@@ -10,6 +10,7 @@ import (
 
 	ibcclienttypes "github.com/cosmos/ibc-go/v10/modules/core/02-client/types"
 	channeltypesv2 "github.com/cosmos/ibc-go/v10/modules/core/04-channel/v2/types"
+	host "github.com/cosmos/ibc-go/v10/modules/core/24-host"
 	ibctmtypes "github.com/cosmos/ibc-go/v10/modules/light-clients/07-tendermint"
 
 	"cosmossdk.io/collections"
@@ -172,6 +173,11 @@ func newEvidenceFixture(t *testing.T) (evidenceFixture, *gomock.Controller) {
 	windowEndHeight := ibcclienttypes.NewHeight(0, 100)
 	ibctmtypes.SetIterationKey(clientStore, belowWindowStartHeight)
 	ibctmtypes.SetIterationKey(clientStore, windowEndHeight)
+	// The anchor seeks read the states from the client store itself.
+	clientStore.Set(host.ConsensusStateKey(belowWindowStartHeight),
+		ibcclienttypes.MustMarshalConsensusState(keeperParams.Cdc, &ibctmtypes.ConsensusState{Timestamp: windowEndTime.Add(-time.Minute)}))
+	clientStore.Set(host.ConsensusStateKey(windowEndHeight),
+		ibcclienttypes.MustMarshalConsensusState(keeperParams.Cdc, &ibctmtypes.ConsensusState{Timestamp: windowEndTime}))
 	mocks.MockClientKeeper.EXPECT().GetStoreProvider().Return(storeProvider).AnyTimes()
 	mocks.MockClientKeeper.EXPECT().GetClientConsensusState(gomock.Any(), declaredClientID, belowWindowStartHeight).
 		Return(&ibctmtypes.ConsensusState{Timestamp: windowEndTime.Add(-time.Minute)}, true).AnyTimes()

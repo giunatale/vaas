@@ -93,7 +93,7 @@ func TestValidateGenesisState(t *testing.T) {
 				[]types.ConsumerState{launchedCS(0, "chainid-1", "client-id")},
 				types.NewParams(
 					types.DefaultTrustingPeriodFraction, types.DefaultLivenessGraceFraction, time.Hour, 600, math.NewInt(42), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration, types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin,
-					types.DefaultInfractionParameters()),
+					types.DefaultInfractionParameters(), types.DefaultConsumerRegistrationFee()),
 				nil,
 				nil,
 				nil,
@@ -125,7 +125,7 @@ func TestValidateGenesisState(t *testing.T) {
 					"0.0", // 0 trusting period fraction here
 					types.DefaultLivenessGraceFraction,
 					vaastypes.DefaultVAASTimeoutPeriod, 600, math.NewInt(42), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration, types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin,
-					types.DefaultInfractionParameters()),
+					types.DefaultInfractionParameters(), types.DefaultConsumerRegistrationFee()),
 				nil,
 				nil,
 				nil,
@@ -144,7 +144,7 @@ func TestValidateGenesisState(t *testing.T) {
 					types.DefaultLivenessGraceFraction,
 					0, // 0 VAAS timeout here
 					600, math.NewInt(42), types.DefaultMinDepositBlocks, types.DefaultMaxPauseDuration, types.DefaultRefusalPauseThreshold, types.DefaultEquivocationExecutionDelay, types.DefaultRemovalVoteDeferralMargin,
-					types.DefaultInfractionParameters()),
+					types.DefaultInfractionParameters(), types.DefaultConsumerRegistrationFee()),
 				nil,
 				nil,
 				nil,
