@@ -44,9 +44,9 @@ others.
 The chain image is built from
 [docker/e2e.Dockerfile](docker/e2e.Dockerfile) and contains both the provider
 and consumer binaries. The relayer image is
-`ghcr.io/allinbits/ibc-v2-ts-relayer:latest`, pulled at runtime
-(`tsRelayerImage` and `tsRelayerImageTag` in
-[e2e_tsrelayer_test.go](e2e_tsrelayer_test.go)).
+`ghcr.io/allinbits/ibc-v2-ts-relayer`, pinned by digest in
+[e2e_tsrelayer_test.go](e2e_tsrelayer_test.go) (`tsRelayerImageDigest`, whose
+comment gives the command that bumps it) and pulled at runtime.
 
 CI runs each suite as its own job, in parallel, through `make test-e2e-suite`
 with the suite's top-level test name; the same target runs one suite locally:
